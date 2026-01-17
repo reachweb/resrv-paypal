@@ -1,0 +1,51 @@
+{
+    "name": "reachweb/resrv-payment-paypal",
+    "description": "PayPal payment gateway for Statamic Resrv",
+    "keywords": ["statamic", "resrv", "paypal", "payment"],
+    "license": "MIT",
+    "type": "statamic-addon",
+    "authors": [
+        {
+            "name": "Reach Web Agency",
+            "email": "info@reach.gr"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "paypal/paypal-server-sdk": "^2.1",
+        "reachweb/statamic-resrv": "^5.0",
+        "statamic/cms": "^5.0"
+    },
+    "require-dev": {
+        "laravel/pint": "^1.17",
+        "orchestra/testbench": "^9.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Reach\\ResrvPaymentPaypal\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Reach\\ResrvPaymentPaypal\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "statamic": {
+            "name": "Resrv PayPal Payment",
+            "description": "PayPal payment gateway for Resrv"
+        },
+        "laravel": {
+            "providers": [
+                "Reach\\ResrvPaymentPaypal\\PaypalServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "config": {
+        "allow-plugins": {
+            "pixelfear/composer-dist-plugin": true
+        }
+    }
+}
