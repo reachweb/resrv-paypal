@@ -103,6 +103,11 @@ class PaypalPaymentGatewayTest extends TestCase
     #[Test]
     public function it_ignores_irrelevant_webhook_events(): void
     {
+        // Create a partial mock to bypass signature verification
+        $gateway = Mockery::mock(PaypalPaymentGateway::class)->makePartial();
+        $gateway->shouldAllowMockingProtectedMethods();
+        $gateway->shouldReceive('verifyWebhookSignature')->andReturn(true);
+
         $request = Request::create(
             '/',
             'POST',
@@ -116,8 +121,34 @@ class PaypalPaymentGatewayTest extends TestCase
             ])
         );
 
-        $response = $this->gateway->verifyPayment($request);
+        $response = $gateway->verifyPayment($request);
 
         $this->assertEquals(200, $response->getStatusCode());
+    }
+
+    #[Test]
+    public function it_rejects_webhooks_with_invalid_signature(): void
+    {
+        // Create a partial mock with invalid signature
+        $gateway = Mockery::mock(PaypalPaymentGateway::class)->makePartial();
+        $gateway->shouldAllowMockingProtectedMethods();
+        $gateway->shouldReceive('verifyWebhookSignature')->andReturn(false);
+
+        $request = Request::create(
+            '/',
+            'POST',
+            [],
+            [],
+            [],
+            ['CONTENT_TYPE' => 'application/json'],
+            json_encode([
+                'event_type' => 'PAYMENT.CAPTURE.COMPLETED',
+                'resource' => ['id' => 'test_id'],
+            ])
+        );
+
+        $this->expectException(\Symfony\Component\HttpKernel\Exception\HttpException::class);
+
+        $gateway->verifyPayment($request);
     }
 }

@@ -96,6 +96,11 @@ class PaypalPaymentGateway implements PaymentInterface
             ->firstWhere(fn ($link) => $link->getRel() === 'payer-action')
             ?->getHref();
 
+        // SECURITY: Store the pending order ID to validate on capture
+        // This prevents token substitution attacks where an attacker uses
+        // a valid order token from one reservation against another
+        $reservation->update(['pending_order_id' => $result->getId()]);
+
         $paymentIntent = new \stdClass;
         $paymentIntent->id = $result->getId();
         $paymentIntent->client_secret = '';
@@ -168,10 +173,40 @@ class PaypalPaymentGateway implements PaymentInterface
         }
 
         if ($token) {
+            // SECURITY: Validate that the order token matches the one we created for this reservation
+            // This prevents token substitution attacks (IDOR)
+            if ($reservation->pending_order_id && $reservation->pending_order_id !== $token) {
+                Log::warning('PayPal order token mismatch', [
+                    'reservation_id' => $reservation->id,
+                    'expected_token' => $reservation->pending_order_id,
+                    'received_token' => $token,
+                ]);
+
+                return [
+                    'status' => false,
+                    'reservation' => $reservation->toArray(),
+                ];
+            }
+
             try {
                 $ordersController = $this->client->getOrdersController();
                 $response = $ordersController->ordersCapture(['id' => $token]);
                 $result = $response->getResult();
+
+                // SECURITY: Validate that the order's reference_id matches our reservation ID
+                // This is a defense-in-depth check to ensure order-reservation binding
+                $referenceId = $result->getPurchaseUnits()[0]->getReferenceId();
+                if ($referenceId !== (string) $reservation->id) {
+                    Log::warning('PayPal order reference_id mismatch', [
+                        'reservation_id' => $reservation->id,
+                        'order_reference_id' => $referenceId,
+                    ]);
+
+                    return [
+                        'status' => false,
+                        'reservation' => $reservation->toArray(),
+                    ];
+                }
 
                 if ($result->getStatus() === 'COMPLETED') {
                     $captureId = $result->getPurchaseUnits()[0]
@@ -179,7 +214,11 @@ class PaypalPaymentGateway implements PaymentInterface
                         ->getCaptures()[0]
                         ->getId();
 
-                    $reservation->update(['payment_id' => $captureId]);
+                    // Clear pending_order_id and store the capture ID
+                    $reservation->update([
+                        'payment_id' => $captureId,
+                        'pending_order_id' => null,
+                    ]);
 
                     return [
                         'status' => true,
@@ -219,6 +258,21 @@ class PaypalPaymentGateway implements PaymentInterface
             abort(403);
         }
 
+        // SECURITY: Verify webhook signature FIRST before any database operations
+        // This prevents enumeration attacks and ensures we only process authentic PayPal webhooks
+        try {
+            $isValid = $this->verifyWebhookSignature($request, $payload);
+
+            if (! $isValid) {
+                Log::warning('PayPal webhook: Invalid signature');
+                abort(403);
+            }
+        } catch (\Exception $e) {
+            Log::error('PayPal webhook signature verification failed: '.$e->getMessage());
+            abort(403);
+        }
+
+        // Only proceed with processing after signature is verified
         $eventType = $data['event_type'] ?? null;
 
         if (! in_array($eventType, ['PAYMENT.CAPTURE.COMPLETED', 'PAYMENT.CAPTURE.DENIED', 'PAYMENT.CAPTURE.REFUNDED'])) {
@@ -243,19 +297,6 @@ class PaypalPaymentGateway implements PaymentInterface
 
         if ($reservation->status === ReservationStatus::CONFIRMED) {
             return response()->json([], 200);
-        }
-
-        // Verify webhook signature
-        try {
-            $isValid = $this->verifyWebhookSignature($request, $payload);
-
-            if (! $isValid) {
-                Log::warning('PayPal webhook: Invalid signature');
-                abort(403);
-            }
-        } catch (\Exception $e) {
-            Log::error('PayPal webhook signature verification failed: '.$e->getMessage());
-            abort(403);
         }
 
         if ($eventType === 'PAYMENT.CAPTURE.COMPLETED') {
