@@ -3,7 +3,6 @@
 namespace Reach\ResrvPaymentPaypal\Http\Payment;
 
 use Illuminate\Cache\RateLimiter;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use PaypalServerSdkLib\Models\Builders\AmountWithBreakdownBuilder;
 use PaypalServerSdkLib\Models\Builders\OrderRequestBuilder;
@@ -26,6 +25,7 @@ use Reach\StatamicResrv\Models\Reservation;
 class PaypalPaymentGateway implements PaymentInterface
 {
     use HandlesStatamicQueries;
+    use PaypalApiTrait;
 
     protected PaypalServerSdkClient $client;
 
@@ -35,29 +35,6 @@ class PaypalPaymentGateway implements PaymentInterface
     {
         $this->client = app(PaypalServerSdkClient::class);
         $this->webhookVerifier = $webhookVerifier ?? app(WebhookSignatureVerifier::class);
-    }
-
-    protected function getPaypalApiBaseUrl(): string
-    {
-        return config('services.paypal.mode') === 'live'
-            ? 'https://api-m.paypal.com'
-            : 'https://api-m.sandbox.paypal.com';
-    }
-
-    protected function getAccessToken(): string
-    {
-        $response = Http::withBasicAuth(
-            config('services.paypal.client_id'),
-            config('services.paypal.client_secret')
-        )->asForm()->post($this->getPaypalApiBaseUrl().'/v1/oauth2/token', [
-            'grant_type' => 'client_credentials',
-        ]);
-
-        if (! $response->successful()) {
-            throw new \RuntimeException('Failed to obtain PayPal access token');
-        }
-
-        return $response->json('access_token');
     }
 
     public function paymentIntent($payment, Reservation $reservation, $data)
@@ -172,11 +149,13 @@ class PaypalPaymentGateway implements PaymentInterface
         }
 
         if ($token) {
-            // SECURITY: Rate limit capture attempts per IP to prevent brute-force token guessing
+            // SECURITY: Rate limit suspicious attempts per IP
+            // Failed validation attempts are penalized more heavily to prevent enumeration
             $rateLimiter = app(RateLimiter::class);
             $rateLimitKey = 'paypal-capture:'.request()->ip();
+            $maxAttempts = 10;
 
-            if ($rateLimiter->tooManyAttempts($rateLimitKey, 10)) {
+            if ($rateLimiter->tooManyAttempts($rateLimitKey, $maxAttempts)) {
                 Log::warning('PayPal capture rate limit exceeded', [
                     'ip' => request()->ip(),
                     'reservation_id' => $reservation->id,
@@ -188,21 +167,94 @@ class PaypalPaymentGateway implements PaymentInterface
                 ];
             }
 
-            $rateLimiter->hit($rateLimitKey, 60); // 10 attempts per minute
+            $ordersController = $this->client->getOrdersController();
 
+            // SECURITY: Get order details FIRST to validate reference_id BEFORE capturing payment
+            // This ensures we don't capture payment for a mismatched reservation
             try {
-                $ordersController = $this->client->getOrdersController();
-
-                // SECURITY: Get order details FIRST to validate reference_id BEFORE capturing payment
-                // This ensures we don't capture payment for a mismatched reservation
                 $orderResponse = $ordersController->ordersGet(['id' => $token]);
                 $order = $orderResponse->getResult();
+            } catch (\Exception $e) {
+                // Don't penalize for PayPal API failures - not a security event
+                Log::error('PayPal order retrieval failed', [
+                    'token' => $token,
+                    'reservation_id' => $reservation->id,
+                    'error' => $e->getMessage(),
+                ]);
 
-                $referenceId = $order->getPurchaseUnits()[0]->getReferenceId();
-                if ($referenceId !== (string) $reservation->id) {
-                    Log::warning('PayPal order reference_id mismatch - payment NOT captured', [
+                return [
+                    'status' => false,
+                    'reservation' => $reservation->toArray(),
+                ];
+            }
+
+            $purchaseUnits = $order->getPurchaseUnits();
+            if (empty($purchaseUnits)) {
+                Log::error('PayPal order missing purchase units', [
+                    'token' => $token,
+                    'reservation_id' => $reservation->id,
+                ]);
+
+                return [
+                    'status' => false,
+                    'reservation' => $reservation->toArray(),
+                ];
+            }
+
+            $referenceId = $purchaseUnits[0]->getReferenceId();
+            if ($referenceId !== (string) $reservation->id) {
+                // SECURITY: This is a potential attack - penalize heavily (3 strikes)
+                $rateLimiter->hit($rateLimitKey, 300); // 5 minute decay
+                $rateLimiter->hit($rateLimitKey, 300);
+                $rateLimiter->hit($rateLimitKey, 300);
+
+                Log::warning('PayPal order reference_id mismatch - payment NOT captured', [
+                    'reservation_id' => $reservation->id,
+                    'order_reference_id' => $referenceId,
+                    'ip' => request()->ip(),
+                ]);
+
+                return [
+                    'status' => false,
+                    'reservation' => $reservation->toArray(),
+                ];
+            }
+
+            // Validation passed - count as normal attempt
+            $rateLimiter->hit($rateLimitKey, 60);
+
+            // Now safe to capture - order is validated
+            try {
+                $response = $ordersController->ordersCapture(['id' => $token]);
+                $result = $response->getResult();
+            } catch (\Exception $e) {
+                // Don't penalize for PayPal API failures - not a security event
+                Log::error('PayPal capture failed', [
+                    'token' => $token,
+                    'reservation_id' => $reservation->id,
+                    'error' => $e->getMessage(),
+                ]);
+
+                return [
+                    'status' => false,
+                    'reservation' => $reservation->toArray(),
+                ];
+            }
+
+            if ($result->getStatus() === 'COMPLETED') {
+                // Success - clear the rate limit for this IP
+                $rateLimiter->clear($rateLimitKey);
+
+                $resultPurchaseUnits = $result->getPurchaseUnits();
+                $payments = $resultPurchaseUnits[0]?->getPayments();
+                $captures = $payments?->getCaptures();
+
+                if (empty($resultPurchaseUnits) || empty($captures)) {
+                    Log::error('PayPal capture response missing expected data', [
+                        'token' => $token,
                         'reservation_id' => $reservation->id,
-                        'order_reference_id' => $referenceId,
+                        'has_purchase_units' => ! empty($resultPurchaseUnits),
+                        'has_captures' => ! empty($captures),
                     ]);
 
                     return [
@@ -211,32 +263,21 @@ class PaypalPaymentGateway implements PaymentInterface
                     ];
                 }
 
-                // Now safe to capture - order is validated
-                $response = $ordersController->ordersCapture(['id' => $token]);
-                $result = $response->getResult();
+                $captureId = $captures[0]->getId();
 
-                if ($result->getStatus() === 'COMPLETED') {
-                    $captureId = $result->getPurchaseUnits()[0]
-                        ->getPayments()
-                        ->getCaptures()[0]
-                        ->getId();
+                $reservation->update(['payment_id' => $captureId]);
 
-                    $reservation->update(['payment_id' => $captureId]);
+                return [
+                    'status' => true,
+                    'reservation' => $reservation->fresh()->toArray(),
+                ];
+            }
 
-                    return [
-                        'status' => true,
-                        'reservation' => $reservation->fresh()->toArray(),
-                    ];
-                }
-
-                if ($result->getStatus() === 'PENDING') {
-                    return [
-                        'status' => 'pending',
-                        'reservation' => $reservation->toArray(),
-                    ];
-                }
-            } catch (\Exception $e) {
-                Log::error('PayPal capture failed: '.$e->getMessage());
+            if ($result->getStatus() === 'PENDING') {
+                return [
+                    'status' => 'pending',
+                    'reservation' => $reservation->toArray(),
+                ];
             }
         }
 

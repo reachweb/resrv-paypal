@@ -8,6 +8,8 @@ use Illuminate\Support\Facades\Log;
 
 class WebhookSignatureVerifier
 {
+    use PaypalApiTrait;
+
     public function verify(Request $request, string $payload): bool
     {
         $webhookId = config('services.paypal.webhook_id');
@@ -54,28 +56,5 @@ class WebhookSignatureVerifier
         $verificationStatus = $response->json('verification_status');
 
         return $verificationStatus === 'SUCCESS';
-    }
-
-    protected function getPaypalApiBaseUrl(): string
-    {
-        return config('services.paypal.mode') === 'live'
-            ? 'https://api-m.paypal.com'
-            : 'https://api-m.sandbox.paypal.com';
-    }
-
-    protected function getAccessToken(): string
-    {
-        $response = Http::withBasicAuth(
-            config('services.paypal.client_id'),
-            config('services.paypal.client_secret')
-        )->asForm()->post($this->getPaypalApiBaseUrl().'/v1/oauth2/token', [
-            'grant_type' => 'client_credentials',
-        ]);
-
-        if (! $response->successful()) {
-            throw new \RuntimeException('Failed to obtain PayPal access token');
-        }
-
-        return $response->json('access_token');
     }
 }
