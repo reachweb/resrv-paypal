@@ -9,6 +9,7 @@ use PaypalServerSdkLib\Controllers\PaymentsController;
 use PaypalServerSdkLib\PaypalServerSdkClient;
 use PHPUnit\Framework\Attributes\Test;
 use Reach\ResrvPaymentPaypal\Http\Payment\PaypalPaymentGateway;
+use Reach\ResrvPaymentPaypal\Http\Payment\WebhookSignatureVerifier;
 use Reach\ResrvPaymentPaypal\Tests\TestCase;
 use Reach\StatamicResrv\Models\Reservation;
 
@@ -22,6 +23,8 @@ class PaypalPaymentGatewayTest extends TestCase
 
     protected $mockPaymentsController;
 
+    protected $mockWebhookVerifier;
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -29,6 +32,7 @@ class PaypalPaymentGatewayTest extends TestCase
         $this->mockClient = Mockery::mock(PaypalServerSdkClient::class);
         $this->mockOrdersController = Mockery::mock(OrdersController::class);
         $this->mockPaymentsController = Mockery::mock(PaymentsController::class);
+        $this->mockWebhookVerifier = Mockery::mock(WebhookSignatureVerifier::class);
 
         $this->mockClient->shouldReceive('getOrdersController')
             ->andReturn($this->mockOrdersController);
@@ -36,8 +40,9 @@ class PaypalPaymentGatewayTest extends TestCase
             ->andReturn($this->mockPaymentsController);
 
         $this->app->instance(PaypalServerSdkClient::class, $this->mockClient);
+        $this->app->instance(WebhookSignatureVerifier::class, $this->mockWebhookVerifier);
 
-        $this->gateway = new PaypalPaymentGateway;
+        $this->gateway = new PaypalPaymentGateway($this->mockWebhookVerifier);
     }
 
     protected function tearDown(): void
@@ -103,10 +108,11 @@ class PaypalPaymentGatewayTest extends TestCase
     #[Test]
     public function it_ignores_irrelevant_webhook_events(): void
     {
-        // Create a partial mock to bypass signature verification
-        $gateway = Mockery::mock(PaypalPaymentGateway::class)->makePartial();
-        $gateway->shouldAllowMockingProtectedMethods();
-        $gateway->shouldReceive('verifyWebhookSignature')->andReturn(true);
+        // Mock the verifier to return true (valid signature)
+        $this->mockWebhookVerifier
+            ->shouldReceive('verify')
+            ->once()
+            ->andReturn(true);
 
         $request = Request::create(
             '/',
@@ -121,7 +127,7 @@ class PaypalPaymentGatewayTest extends TestCase
             ])
         );
 
-        $response = $gateway->verifyPayment($request);
+        $response = $this->gateway->verifyPayment($request);
 
         $this->assertEquals(200, $response->getStatusCode());
     }
@@ -129,10 +135,11 @@ class PaypalPaymentGatewayTest extends TestCase
     #[Test]
     public function it_rejects_webhooks_with_invalid_signature(): void
     {
-        // Create a partial mock with invalid signature
-        $gateway = Mockery::mock(PaypalPaymentGateway::class)->makePartial();
-        $gateway->shouldAllowMockingProtectedMethods();
-        $gateway->shouldReceive('verifyWebhookSignature')->andReturn(false);
+        // Mock the verifier to return false (invalid signature)
+        $this->mockWebhookVerifier
+            ->shouldReceive('verify')
+            ->once()
+            ->andReturn(false);
 
         $request = Request::create(
             '/',
@@ -149,6 +156,33 @@ class PaypalPaymentGatewayTest extends TestCase
 
         $this->expectException(\Symfony\Component\HttpKernel\Exception\HttpException::class);
 
-        $gateway->verifyPayment($request);
+        $this->gateway->verifyPayment($request);
+    }
+
+    #[Test]
+    public function it_rejects_webhooks_when_signature_verification_throws(): void
+    {
+        // Mock the verifier to throw an exception
+        $this->mockWebhookVerifier
+            ->shouldReceive('verify')
+            ->once()
+            ->andThrow(new \RuntimeException('PayPal webhook ID is not configured.'));
+
+        $request = Request::create(
+            '/',
+            'POST',
+            [],
+            [],
+            [],
+            ['CONTENT_TYPE' => 'application/json'],
+            json_encode([
+                'event_type' => 'PAYMENT.CAPTURE.COMPLETED',
+                'resource' => ['id' => 'test_id'],
+            ])
+        );
+
+        $this->expectException(\Symfony\Component\HttpKernel\Exception\HttpException::class);
+
+        $this->gateway->verifyPayment($request);
     }
 }

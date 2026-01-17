@@ -2,6 +2,7 @@
 
 namespace Reach\ResrvPaymentPaypal\Http\Payment;
 
+use Illuminate\Cache\RateLimiter;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use PaypalServerSdkLib\Models\Builders\AmountWithBreakdownBuilder;
@@ -28,9 +29,12 @@ class PaypalPaymentGateway implements PaymentInterface
 
     protected PaypalServerSdkClient $client;
 
-    public function __construct()
+    protected WebhookSignatureVerifier $webhookVerifier;
+
+    public function __construct(?WebhookSignatureVerifier $webhookVerifier = null)
     {
         $this->client = app(PaypalServerSdkClient::class);
+        $this->webhookVerifier = $webhookVerifier ?? app(WebhookSignatureVerifier::class);
     }
 
     protected function getPaypalApiBaseUrl(): string
@@ -95,11 +99,6 @@ class PaypalPaymentGateway implements PaymentInterface
         $approvalUrl = collect($result->getLinks())
             ->firstWhere(fn ($link) => $link->getRel() === 'payer-action')
             ?->getHref();
-
-        // SECURITY: Store the pending order ID to validate on capture
-        // This prevents token substitution attacks where an attacker uses
-        // a valid order token from one reservation against another
-        $reservation->update(['pending_order_id' => $result->getId()]);
 
         $paymentIntent = new \stdClass;
         $paymentIntent->id = $result->getId();
@@ -173,13 +172,14 @@ class PaypalPaymentGateway implements PaymentInterface
         }
 
         if ($token) {
-            // SECURITY: Validate that the order token matches the one we created for this reservation
-            // This prevents token substitution attacks (IDOR)
-            if ($reservation->pending_order_id && $reservation->pending_order_id !== $token) {
-                Log::warning('PayPal order token mismatch', [
+            // SECURITY: Rate limit capture attempts per IP to prevent brute-force token guessing
+            $rateLimiter = app(RateLimiter::class);
+            $rateLimitKey = 'paypal-capture:'.request()->ip();
+
+            if ($rateLimiter->tooManyAttempts($rateLimitKey, 10)) {
+                Log::warning('PayPal capture rate limit exceeded', [
+                    'ip' => request()->ip(),
                     'reservation_id' => $reservation->id,
-                    'expected_token' => $reservation->pending_order_id,
-                    'received_token' => $token,
                 ]);
 
                 return [
@@ -188,16 +188,19 @@ class PaypalPaymentGateway implements PaymentInterface
                 ];
             }
 
+            $rateLimiter->hit($rateLimitKey, 60); // 10 attempts per minute
+
             try {
                 $ordersController = $this->client->getOrdersController();
-                $response = $ordersController->ordersCapture(['id' => $token]);
-                $result = $response->getResult();
 
-                // SECURITY: Validate that the order's reference_id matches our reservation ID
-                // This is a defense-in-depth check to ensure order-reservation binding
-                $referenceId = $result->getPurchaseUnits()[0]->getReferenceId();
+                // SECURITY: Get order details FIRST to validate reference_id BEFORE capturing payment
+                // This ensures we don't capture payment for a mismatched reservation
+                $orderResponse = $ordersController->ordersGet(['id' => $token]);
+                $order = $orderResponse->getResult();
+
+                $referenceId = $order->getPurchaseUnits()[0]->getReferenceId();
                 if ($referenceId !== (string) $reservation->id) {
-                    Log::warning('PayPal order reference_id mismatch', [
+                    Log::warning('PayPal order reference_id mismatch - payment NOT captured', [
                         'reservation_id' => $reservation->id,
                         'order_reference_id' => $referenceId,
                     ]);
@@ -208,17 +211,17 @@ class PaypalPaymentGateway implements PaymentInterface
                     ];
                 }
 
+                // Now safe to capture - order is validated
+                $response = $ordersController->ordersCapture(['id' => $token]);
+                $result = $response->getResult();
+
                 if ($result->getStatus() === 'COMPLETED') {
                     $captureId = $result->getPurchaseUnits()[0]
                         ->getPayments()
                         ->getCaptures()[0]
                         ->getId();
 
-                    // Clear pending_order_id and store the capture ID
-                    $reservation->update([
-                        'payment_id' => $captureId,
-                        'pending_order_id' => null,
-                    ]);
+                    $reservation->update(['payment_id' => $captureId]);
 
                     return [
                         'status' => true,
@@ -261,7 +264,7 @@ class PaypalPaymentGateway implements PaymentInterface
         // SECURITY: Verify webhook signature FIRST before any database operations
         // This prevents enumeration attacks and ensures we only process authentic PayPal webhooks
         try {
-            $isValid = $this->verifyWebhookSignature($request, $payload);
+            $isValid = $this->webhookVerifier->verify($request, $payload);
 
             if (! $isValid) {
                 Log::warning('PayPal webhook: Invalid signature');
@@ -311,53 +314,5 @@ class PaypalPaymentGateway implements PaymentInterface
     public function verifyWebhook()
     {
         return true;
-    }
-
-    protected function verifyWebhookSignature($request, string $payload): bool
-    {
-        $webhookId = config('services.paypal.webhook_id');
-
-        if (! $webhookId) {
-            throw new \RuntimeException('PayPal webhook ID is not configured. Set PAYPAL_WEBHOOK_ID in your .env file.');
-        }
-
-        $headers = [
-            'auth_algo' => $request->header('PAYPAL-AUTH-ALGO'),
-            'cert_url' => $request->header('PAYPAL-CERT-URL'),
-            'transmission_id' => $request->header('PAYPAL-TRANSMISSION-ID'),
-            'transmission_sig' => $request->header('PAYPAL-TRANSMISSION-SIG'),
-            'transmission_time' => $request->header('PAYPAL-TRANSMISSION-TIME'),
-        ];
-
-        foreach ($headers as $key => $value) {
-            if (empty($value)) {
-                Log::warning("PayPal webhook missing header: {$key}");
-
-                return false;
-            }
-        }
-
-        $accessToken = $this->getAccessToken();
-
-        $response = Http::withToken($accessToken)
-            ->post($this->getPaypalApiBaseUrl().'/v1/notifications/verify-webhook-signature', [
-                'auth_algo' => $headers['auth_algo'],
-                'cert_url' => $headers['cert_url'],
-                'transmission_id' => $headers['transmission_id'],
-                'transmission_sig' => $headers['transmission_sig'],
-                'transmission_time' => $headers['transmission_time'],
-                'webhook_id' => $webhookId,
-                'webhook_event' => json_decode($payload, true),
-            ]);
-
-        if (! $response->successful()) {
-            Log::error('PayPal webhook verification API error: '.$response->body());
-
-            return false;
-        }
-
-        $verificationStatus = $response->json('verification_status');
-
-        return $verificationStatus === 'SUCCESS';
     }
 }

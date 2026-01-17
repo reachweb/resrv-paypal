@@ -7,16 +7,22 @@ use Mockery;
 use PaypalServerSdkLib\PaypalServerSdkClient;
 use PHPUnit\Framework\Attributes\Test;
 use Reach\ResrvPaymentPaypal\Http\Payment\PaypalPaymentGateway;
+use Reach\ResrvPaymentPaypal\Http\Payment\WebhookSignatureVerifier;
 use Reach\ResrvPaymentPaypal\Tests\TestCase;
 
 class WebhookTest extends TestCase
 {
+    protected $mockWebhookVerifier;
+
     protected function setUp(): void
     {
         parent::setUp();
 
         $mockClient = Mockery::mock(PaypalServerSdkClient::class);
         $this->app->instance(PaypalServerSdkClient::class, $mockClient);
+
+        $this->mockWebhookVerifier = Mockery::mock(WebhookSignatureVerifier::class);
+        $this->app->instance(WebhookSignatureVerifier::class, $this->mockWebhookVerifier);
     }
 
     protected function tearDown(): void
@@ -28,10 +34,12 @@ class WebhookTest extends TestCase
     #[Test]
     public function it_ignores_unknown_webhook_events(): void
     {
-        // Create a partial mock to bypass signature verification
-        $gateway = Mockery::mock(PaypalPaymentGateway::class)->makePartial();
-        $gateway->shouldAllowMockingProtectedMethods();
-        $gateway->shouldReceive('verifyWebhookSignature')->andReturn(true);
+        $this->mockWebhookVerifier
+            ->shouldReceive('verify')
+            ->once()
+            ->andReturn(true);
+
+        $gateway = new PaypalPaymentGateway($this->mockWebhookVerifier);
 
         $request = Request::create(
             '/',
@@ -54,7 +62,7 @@ class WebhookTest extends TestCase
     #[Test]
     public function it_returns_true_for_verify_webhook(): void
     {
-        $gateway = new PaypalPaymentGateway;
+        $gateway = new PaypalPaymentGateway($this->mockWebhookVerifier);
 
         $this->assertTrue($gateway->verifyWebhook());
     }
@@ -62,7 +70,7 @@ class WebhookTest extends TestCase
     #[Test]
     public function it_rejects_invalid_json_payload(): void
     {
-        $gateway = new PaypalPaymentGateway;
+        $gateway = new PaypalPaymentGateway($this->mockWebhookVerifier);
 
         $request = Request::create(
             '/',
@@ -82,10 +90,12 @@ class WebhookTest extends TestCase
     #[Test]
     public function it_returns_200_for_events_without_capture_id(): void
     {
-        // Create a partial mock to bypass signature verification
-        $gateway = Mockery::mock(PaypalPaymentGateway::class)->makePartial();
-        $gateway->shouldAllowMockingProtectedMethods();
-        $gateway->shouldReceive('verifyWebhookSignature')->andReturn(true);
+        $this->mockWebhookVerifier
+            ->shouldReceive('verify')
+            ->once()
+            ->andReturn(true);
+
+        $gateway = new PaypalPaymentGateway($this->mockWebhookVerifier);
 
         $request = Request::create(
             '/',
@@ -108,9 +118,12 @@ class WebhookTest extends TestCase
     #[Test]
     public function it_rejects_webhooks_without_valid_signature(): void
     {
-        // Without mocking verifyWebhookSignature, it should fail
-        // because there are no PayPal headers
-        $gateway = new PaypalPaymentGateway;
+        $this->mockWebhookVerifier
+            ->shouldReceive('verify')
+            ->once()
+            ->andReturn(false);
+
+        $gateway = new PaypalPaymentGateway($this->mockWebhookVerifier);
 
         $request = Request::create(
             '/',
