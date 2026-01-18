@@ -23,6 +23,19 @@ php artisan vendor:publish --tag=resrv-paypal-config
 
 ## Configuration
 
+### Services Configuration
+
+Add the PayPal configuration to your `config/services.php` file:
+
+```php
+'paypal' => [
+    'client_id' => env('PAYPAL_CLIENT_ID'),
+    'client_secret' => env('PAYPAL_CLIENT_SECRET'),
+    'mode' => env('PAYPAL_MODE', 'sandbox'),
+    'webhook_id' => env('PAYPAL_WEBHOOK_ID'),
+],
+```
+
 ### Environment Variables
 
 Add the following to your `.env` file:
