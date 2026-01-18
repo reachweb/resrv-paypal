@@ -72,7 +72,7 @@ Webhooks are **mandatory** for this payment gateway. They ensure payment confirm
 1. In your PayPal application settings, add a webhook with your site's webhook URL:
 
 ```
-https://yoursite.com/!/resrv/webhook
+https://yoursite.com/resrv/api/webhook
 ```
 
 2. Subscribe to these events:
