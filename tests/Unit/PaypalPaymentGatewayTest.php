@@ -6,11 +6,13 @@ use Illuminate\Http\Request;
 use Mockery;
 use PaypalServerSdkLib\Controllers\OrdersController;
 use PaypalServerSdkLib\Controllers\PaymentsController;
+use PaypalServerSdkLib\Http\ApiResponse;
 use PaypalServerSdkLib\PaypalServerSdkClient;
 use PHPUnit\Framework\Attributes\Test;
 use Reach\ResrvPaymentPaypal\Http\Payment\PaypalPaymentGateway;
 use Reach\ResrvPaymentPaypal\Http\Payment\WebhookSignatureVerifier;
 use Reach\ResrvPaymentPaypal\Tests\TestCase;
+use Reach\StatamicResrv\Exceptions\RefundFailedException;
 use Reach\StatamicResrv\Models\Reservation;
 
 class PaypalPaymentGatewayTest extends TestCase
@@ -103,6 +105,115 @@ class PaypalPaymentGatewayTest extends TestCase
     public function it_verifies_webhook_returns_true(): void
     {
         $this->assertTrue($this->gateway->verifyWebhook());
+    }
+
+    #[Test]
+    public function it_creates_payment_intent_with_correct_sdk_method(): void
+    {
+        $payment = Mockery::mock();
+        $payment->shouldReceive('format')->andReturn('100.00');
+
+        // Create an entry mock with a title property
+        $entry = new \stdClass;
+        $entry->title = 'Test Reservation';
+
+        // Mock the Reservation class with shouldIgnoreMissing to handle Eloquent's setAttribute
+        $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
+        $reservation->shouldReceive('getAttribute')->with('id')->andReturn(123);
+        $reservation->shouldReceive('entry')->andReturn($entry);
+        $reservation->id = 123;
+
+        $checkoutEntry = Mockery::mock();
+        $checkoutEntry->shouldReceive('absoluteUrl')->andReturn('https://example.com/checkout');
+
+        // Mock the HandlesStatamicQueries trait method
+        $gateway = Mockery::mock(PaypalPaymentGateway::class, [$this->mockWebhookVerifier])
+            ->makePartial()
+            ->shouldAllowMockingProtectedMethods();
+
+        $gateway->shouldReceive('getCheckoutCompleteEntry')->andReturn($checkoutEntry);
+
+        // Re-bind the mock client
+        $this->app->instance(PaypalServerSdkClient::class, $this->mockClient);
+
+        // Mock the order response
+        $link = Mockery::mock();
+        $link->shouldReceive('getRel')->andReturn('payer-action');
+        $link->shouldReceive('getHref')->andReturn('https://paypal.com/approve');
+
+        $orderResult = Mockery::mock();
+        $orderResult->shouldReceive('getId')->andReturn('ORDER-123');
+        $orderResult->shouldReceive('getLinks')->andReturn([$link]);
+
+        $response = Mockery::mock(ApiResponse::class);
+        $response->shouldReceive('getResult')->andReturn($orderResult);
+
+        // Verify the correct method name is called
+        $this->mockOrdersController->shouldReceive('createOrder')
+            ->once()
+            ->with(Mockery::on(function ($args) {
+                return isset($args['body']);
+            }))
+            ->andReturn($response);
+
+        $result = $gateway->paymentIntent($payment, $reservation, []);
+
+        $this->assertEquals('ORDER-123', $result->id);
+        $this->assertEquals('https://paypal.com/approve', $result->redirectTo);
+    }
+
+    #[Test]
+    public function it_refunds_payment_with_correct_sdk_method(): void
+    {
+        $payment = Mockery::mock();
+        $payment->shouldReceive('format')->andReturn('100.00');
+
+        // Mock the Reservation class with shouldIgnoreMissing to handle Eloquent's setAttribute
+        $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
+        $reservation->shouldReceive('getAttribute')->with('payment_id')->andReturn('CAPTURE-123');
+        $reservation->shouldReceive('getAttribute')->with('payment')->andReturn($payment);
+        $reservation->payment_id = 'CAPTURE-123';
+        $reservation->payment = $payment;
+
+        $refundResult = Mockery::mock();
+        $refundResult->shouldReceive('getId')->andReturn('REFUND-123');
+
+        $response = Mockery::mock(ApiResponse::class);
+        $response->shouldReceive('getResult')->andReturn($refundResult);
+
+        // Verify the correct method name is called
+        $this->mockPaymentsController->shouldReceive('refundCapturedPayment')
+            ->once()
+            ->with(Mockery::on(function ($args) {
+                return $args['captureId'] === 'CAPTURE-123' && isset($args['body']);
+            }))
+            ->andReturn($response);
+
+        $result = $this->gateway->refund($reservation);
+
+        $this->assertEquals('REFUND-123', $result->getId());
+    }
+
+    #[Test]
+    public function it_throws_refund_failed_exception_on_error(): void
+    {
+        $payment = Mockery::mock();
+        $payment->shouldReceive('format')->andReturn('100.00');
+
+        // Mock the Reservation class with shouldIgnoreMissing to handle Eloquent's setAttribute
+        $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
+        $reservation->shouldReceive('getAttribute')->with('payment_id')->andReturn('CAPTURE-123');
+        $reservation->shouldReceive('getAttribute')->with('payment')->andReturn($payment);
+        $reservation->payment_id = 'CAPTURE-123';
+        $reservation->payment = $payment;
+
+        $this->mockPaymentsController->shouldReceive('refundCapturedPayment')
+            ->once()
+            ->andThrow(new \Exception('PayPal API error'));
+
+        $this->expectException(RefundFailedException::class);
+
+        $this->gateway->refund($reservation);
     }
 
     #[Test]

@@ -6,6 +6,7 @@ use Illuminate\Cache\RateLimiter;
 use Illuminate\Http\Request;
 use Mockery;
 use PaypalServerSdkLib\Controllers\OrdersController;
+use PaypalServerSdkLib\Http\ApiResponse;
 use PaypalServerSdkLib\PaypalServerSdkClient;
 use PHPUnit\Framework\Attributes\RunInSeparateProcess;
 use PHPUnit\Framework\Attributes\Test;
@@ -107,8 +108,8 @@ class HandleRedirectBackSecurityTest extends TestCase
         // Mock order retrieval with DIFFERENT reference_id (attack scenario)
         $this->mockOrderGet('test-token', '999');
 
-        // ordersCapture should NOT be called
-        $this->mockOrdersController->shouldNotReceive('ordersCapture');
+        // captureOrder should NOT be called
+        $this->mockOrdersController->shouldNotReceive('captureOrder');
 
         $result = $this->gateway->handleRedirectBack();
 
@@ -185,7 +186,7 @@ class HandleRedirectBackSecurityTest extends TestCase
         $this->simulateRequest(['id' => 123, 'token' => 'test-token']);
 
         // Mock API failure
-        $this->mockOrdersController->shouldReceive('ordersGet')
+        $this->mockOrdersController->shouldReceive('getOrder')
             ->once()
             ->andThrow(new \Exception('PayPal API unavailable'));
 
@@ -314,10 +315,10 @@ class HandleRedirectBackSecurityTest extends TestCase
         $order = Mockery::mock();
         $order->shouldReceive('getPurchaseUnits')->andReturn([$purchaseUnit]);
 
-        $response = Mockery::mock();
+        $response = Mockery::mock(ApiResponse::class);
         $response->shouldReceive('getResult')->andReturn($order);
 
-        $this->mockOrdersController->shouldReceive('ordersGet')
+        $this->mockOrdersController->shouldReceive('getOrder')
             ->with(['id' => $token])
             ->andReturn($response);
     }
@@ -330,10 +331,10 @@ class HandleRedirectBackSecurityTest extends TestCase
         $order = Mockery::mock();
         $order->shouldReceive('getPurchaseUnits')->andReturn([$purchaseUnit]);
 
-        $response = Mockery::mock();
+        $response = Mockery::mock(ApiResponse::class);
         $response->shouldReceive('getResult')->andReturn($order);
 
-        $this->mockOrdersController->shouldReceive('ordersGet')
+        $this->mockOrdersController->shouldReceive('getOrder')
             ->with(['id' => $token])
             ->times($times)
             ->andReturn($response);
@@ -357,10 +358,10 @@ class HandleRedirectBackSecurityTest extends TestCase
             $result->shouldReceive('getPurchaseUnits')->andReturn([$purchaseUnit]);
         }
 
-        $response = Mockery::mock();
+        $response = Mockery::mock(ApiResponse::class);
         $response->shouldReceive('getResult')->andReturn($result);
 
-        $this->mockOrdersController->shouldReceive('ordersCapture')
+        $this->mockOrdersController->shouldReceive('captureOrder')
             ->with(['id' => $token])
             ->andReturn($response);
     }

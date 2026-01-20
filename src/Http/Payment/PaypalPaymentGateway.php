@@ -5,6 +5,7 @@ namespace Reach\ResrvPaymentPaypal\Http\Payment;
 use Illuminate\Cache\RateLimiter;
 use Illuminate\Support\Facades\Log;
 use PaypalServerSdkLib\Models\Builders\AmountWithBreakdownBuilder;
+use PaypalServerSdkLib\Models\Builders\MoneyBuilder;
 use PaypalServerSdkLib\Models\Builders\OrderRequestBuilder;
 use PaypalServerSdkLib\Models\Builders\PaymentSourceBuilder;
 use PaypalServerSdkLib\Models\Builders\PayPalWalletBuilder;
@@ -70,7 +71,7 @@ class PaypalPaymentGateway implements PaymentInterface
             )
             ->build();
 
-        $response = $ordersController->ordersCreate(['body' => $orderRequest]);
+        $response = $ordersController->createOrder(['body' => $orderRequest]);
         $result = $response->getResult();
 
         $approvalUrl = collect($result->getLinks())
@@ -90,11 +91,11 @@ class PaypalPaymentGateway implements PaymentInterface
         $paymentsController = $this->client->getPaymentsController();
 
         try {
-            $response = $paymentsController->capturesRefund([
-                'capture_id' => $reservation->payment_id,
+            $response = $paymentsController->refundCapturedPayment([
+                'captureId' => $reservation->payment_id,
                 'body' => RefundRequestBuilder::init()
                     ->amount(
-                        AmountWithBreakdownBuilder::init(
+                        MoneyBuilder::init(
                             config('resrv-config.currency_isoCode'),
                             $reservation->payment->format()
                         )->build()
@@ -172,7 +173,7 @@ class PaypalPaymentGateway implements PaymentInterface
             // SECURITY: Get order details FIRST to validate reference_id BEFORE capturing payment
             // This ensures we don't capture payment for a mismatched reservation
             try {
-                $orderResponse = $ordersController->ordersGet(['id' => $token]);
+                $orderResponse = $ordersController->getOrder(['id' => $token]);
                 $order = $orderResponse->getResult();
             } catch (\Exception $e) {
                 // Don't penalize for PayPal API failures - not a security event
@@ -225,7 +226,7 @@ class PaypalPaymentGateway implements PaymentInterface
 
             // Now safe to capture - order is validated
             try {
-                $response = $ordersController->ordersCapture(['id' => $token]);
+                $response = $ordersController->captureOrder(['id' => $token]);
                 $result = $response->getResult();
             } catch (\Exception $e) {
                 // Don't penalize for PayPal API failures - not a security event
