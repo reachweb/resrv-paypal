@@ -90,6 +90,13 @@ class PaypalCaptureController extends Controller
                         'captureId' => $captureId,
                     ]);
                 }
+
+                Log::warning('PayPal: Capture completed but no capture ID found', [
+                    'order_id' => $orderId,
+                    'reservation_id' => $reservation->id,
+                    'captures_count' => count($captures),
+                    'captures_data' => $captures,
+                ]);
             }
 
             Log::warning('PayPal: Capture did not complete as expected', [

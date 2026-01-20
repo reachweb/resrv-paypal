@@ -14,7 +14,7 @@
             <div id="paypal-button-container" class="mb-6"></div>
 
             <!-- Divider -->
-            <div class="relative my-6">
+            <div id="card-payment-divider" class="relative my-6">
                 <div class="absolute inset-0 flex items-center">
                     <div class="w-full border-t border-gray-300"></div>
                 </div>
@@ -81,8 +81,8 @@
             </form>
 
             <!-- Error Display -->
-            <p x-show="errors" x-cloak x-transition class="mt-6 xm:mt-8 text-red-600">
-                <span x-html="errors"></span>
+            <p x-show="errors" x-cloak x-transition class="mt-6 xl:mt-8 text-red-600">
+                <span x-text="errors"></span>
             </p>
         </div>
     </div>
@@ -226,7 +226,7 @@ Alpine.data('paypalPayment', () => ({
         } else {
             // Hide card form if not eligible
             document.getElementById('card-form').style.display = 'none';
-            document.querySelector('.relative.my-6').style.display = 'none'; // Hide divider
+            document.getElementById('card-payment-divider').style.display = 'none';
             console.log('Card fields not eligible for this merchant');
         }
     },
