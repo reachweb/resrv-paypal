@@ -88,6 +88,7 @@ class PaypalCaptureController extends Controller
                     return response()->json([
                         'status' => 'COMPLETED',
                         'captureId' => $captureId,
+                        'reservationId' => $reservation->id,
                     ]);
                 }
 

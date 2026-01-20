@@ -251,13 +251,10 @@ Alpine.data('paypalPayment', () => ({
     },
 
     async captureOrder(orderID) {
-        const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
-
         const response = await fetch(`/resrv-paypal/capture/${orderID}`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'X-CSRF-TOKEN': csrfToken,
                 'Accept': 'application/json'
             }
         });
@@ -265,10 +262,10 @@ Alpine.data('paypalPayment', () => ({
         const result = await response.json();
 
         if (response.ok && result.status === 'COMPLETED') {
-            // Redirect to checkout completed page
-            window.location.href = this.checkoutCompletedUrl + '?id={{ request()->input("id") }}';
+            // Redirect to checkout completed page with reservation ID from response
+            window.location.href = this.checkoutCompletedUrl + '?id=' + result.reservationId;
         } else {
-            throw new Error(result.error || 'Payment capture failed');
+            throw new Error(result.error || result.message || 'Payment capture failed');
         }
     }
 }));
