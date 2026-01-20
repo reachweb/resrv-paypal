@@ -90,9 +90,10 @@ class PaypalPaymentGatewayTest extends TestCase
     }
 
     #[Test]
-    public function it_redirects_for_payment(): void
+    public function it_does_not_redirect_for_payment(): void
     {
-        $this->assertTrue($this->gateway->redirectsForPayment());
+        // JS SDK flow does not redirect - payment is handled inline
+        $this->assertFalse($this->gateway->redirectsForPayment());
     }
 
     #[Test]
@@ -123,27 +124,12 @@ class PaypalPaymentGatewayTest extends TestCase
         $reservation->shouldReceive('entry')->andReturn($entry);
         $reservation->id = 123;
 
-        $checkoutEntry = Mockery::mock();
-        $checkoutEntry->shouldReceive('absoluteUrl')->andReturn('https://example.com/checkout');
-
-        // Mock the HandlesStatamicQueries trait method
-        $gateway = Mockery::mock(PaypalPaymentGateway::class, [$this->mockWebhookVerifier])
-            ->makePartial()
-            ->shouldAllowMockingProtectedMethods();
-
-        $gateway->shouldReceive('getCheckoutCompleteEntry')->andReturn($checkoutEntry);
-
         // Re-bind the mock client
         $this->app->instance(PaypalServerSdkClient::class, $this->mockClient);
 
-        // Mock the order response
-        $link = Mockery::mock();
-        $link->shouldReceive('getRel')->andReturn('payer-action');
-        $link->shouldReceive('getHref')->andReturn('https://paypal.com/approve');
-
+        // Mock the order response (JS SDK flow - no links needed)
         $orderResult = Mockery::mock();
         $orderResult->shouldReceive('getId')->andReturn('ORDER-123');
-        $orderResult->shouldReceive('getLinks')->andReturn([$link]);
 
         $response = Mockery::mock(ApiResponse::class);
         $response->shouldReceive('getResult')->andReturn($orderResult);
@@ -156,10 +142,11 @@ class PaypalPaymentGatewayTest extends TestCase
             }))
             ->andReturn($response);
 
-        $result = $gateway->paymentIntent($payment, $reservation, []);
+        $result = $this->gateway->paymentIntent($payment, $reservation, []);
 
+        // JS SDK flow: id and client_secret both contain the order ID
         $this->assertEquals('ORDER-123', $result->id);
-        $this->assertEquals('https://paypal.com/approve', $result->redirectTo);
+        $this->assertEquals('ORDER-123', $result->client_secret);
     }
 
     #[Test]
