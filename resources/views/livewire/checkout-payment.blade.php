@@ -15,34 +15,34 @@
                 <div class="space-y-4">
                     <!-- Card Number -->
                     <div>
-                        <label for="card-number" class="block text-sm font-medium text-gray-700 mb-1">
+                        <label for="card-number" class="block font-medium text-gray-700 mb-1">
                             {{ __('Card Number') }}
                         </label>
-                        <div id="card-number-field-container" class="h-12"></div>
+                        <div id="card-number-field-container"></div>
                     </div>
 
                     <!-- Expiry and CVV Row -->
                     <div class="grid grid-cols-2 gap-4">
                         <div>
-                            <label for="card-expiry" class="block text-sm font-medium text-gray-700 mb-1">
+                            <label for="card-expiry" class="block font-medium text-gray-700 mb-1">
                                 {{ __('Expiry Date') }}
                             </label>
-                            <div id="card-expiry-field-container" class="h-12"></div>
+                            <div id="card-expiry-field-container"></div>
                         </div>
                         <div>
-                            <label for="card-cvv" class="block text-sm font-medium text-gray-700 mb-1">
+                            <label for="card-cvv" class="block font-medium text-gray-700 mb-1">
                                 {{ __('CVV') }}
                             </label>
-                            <div id="card-cvv-field-container" class="h-12"></div>
+                            <div id="card-cvv-field-container"></div>
                         </div>
                     </div>
 
                     <!-- Cardholder Name -->
                     <div>
-                        <label for="card-name" class="block text-sm font-medium text-gray-700 mb-1">
+                        <label for="card-name" class="block font-medium text-gray-700 mb-1">
                             {{ __('Cardholder Name') }}
                         </label>
-                        <div id="card-name-field-container" class="h-12"></div>
+                        <div id="card-name-field-container"></div>
                     </div>
                 </div>
 
@@ -68,17 +68,14 @@
             </form>
 
             <!-- Divider -->
-            <div id="card-payment-divider" class="relative my-6">
-                <div class="absolute inset-0 flex items-center">
-                    <div class="w-full border-t border-gray-300"></div>
-                </div>
-                <div class="relative flex justify-center text-sm">
-                    <span class="px-4 text-gray-500">{{ __('or pay with PayPal') }}</span>
-                </div>
+            <div id="card-payment-divider" class="flex items-center my-6 xl:my-8">
+                <div class="grow border-t border-gray-300"></div>
+                <span class="px-4 text-sm text-gray-500">{{ __('or pay with PayPal') }}</span>
+                <div class="grow border-t border-gray-300"></div>
             </div>
 
             <!-- PayPal Button Container -->
-            <div id="paypal-button-container"></div>
+            <div id="paypal-button-container" class="max-w-xs md:max-w-md xl:max-w-lg mx-auto"></div>
 
             <!-- Error Display -->
             <p x-show="errors" x-cloak x-transition class="mt-6 xl:mt-8 text-red-600">
