@@ -40,6 +40,13 @@ class PaypalPaymentGateway implements PaymentInterface
 
     public function paymentIntent($payment, Reservation $reservation, $data)
     {
+        Log::info('PayPal: Creating order', [
+            'reservation_id' => $reservation->id,
+            'amount' => $payment->format(),
+            'currency' => config('resrv-config.currency_isoCode'),
+            'entry_title' => $reservation->entry()->title,
+        ]);
+
         $ordersController = $this->client->getOrdersController();
 
         $orderRequest = OrderRequestBuilder::init(CheckoutPaymentIntent::CAPTURE, [
@@ -78,6 +85,12 @@ class PaypalPaymentGateway implements PaymentInterface
             ->firstWhere(fn ($link) => $link->getRel() === 'payer-action')
             ?->getHref();
 
+        Log::info('PayPal: Order created successfully', [
+            'reservation_id' => $reservation->id,
+            'order_id' => $result->getId(),
+            'approval_url' => $approvalUrl,
+        ]);
+
         $paymentIntent = new \stdClass;
         $paymentIntent->id = $result->getId();
         $paymentIntent->client_secret = '';
@@ -88,6 +101,13 @@ class PaypalPaymentGateway implements PaymentInterface
 
     public function refund(Reservation $reservation)
     {
+        Log::info('PayPal: Initiating refund', [
+            'reservation_id' => $reservation->id,
+            'capture_id' => $reservation->payment_id,
+            'amount' => $reservation->payment->format(),
+            'currency' => config('resrv-config.currency_isoCode'),
+        ]);
+
         $paymentsController = $this->client->getPaymentsController();
 
         try {
@@ -103,8 +123,22 @@ class PaypalPaymentGateway implements PaymentInterface
                     ->build(),
             ]);
 
-            return $response->getResult();
+            $result = $response->getResult();
+
+            Log::info('PayPal: Refund completed successfully', [
+                'reservation_id' => $reservation->id,
+                'capture_id' => $reservation->payment_id,
+                'refund_id' => is_array($result) ? ($result['id'] ?? null) : $result->getId(),
+            ]);
+
+            return $result;
         } catch (\Exception $exception) {
+            Log::error('PayPal: Refund failed', [
+                'reservation_id' => $reservation->id,
+                'capture_id' => $reservation->payment_id,
+                'error' => $exception->getMessage(),
+            ]);
+
             throw new RefundFailedException($exception->getMessage());
         }
     }
@@ -140,9 +174,20 @@ class PaypalPaymentGateway implements PaymentInterface
         $token = request()->input('token');
         $cancelled = request()->input('cancelled');
 
+        Log::info('PayPal: Handling redirect back', [
+            'reservation_id' => $id,
+            'token' => $token,
+            'cancelled' => $cancelled ? 'yes' : 'no',
+            'ip' => request()->ip(),
+        ]);
+
         $reservation = Reservation::findOrFail($id);
 
         if ($cancelled) {
+            Log::info('PayPal: User cancelled payment', [
+                'reservation_id' => $reservation->id,
+            ]);
+
             return [
                 'status' => false,
                 'reservation' => $reservation->toArray(),
@@ -157,7 +202,7 @@ class PaypalPaymentGateway implements PaymentInterface
             $maxAttempts = 10;
 
             if ($rateLimiter->tooManyAttempts($rateLimitKey, $maxAttempts)) {
-                Log::warning('PayPal capture rate limit exceeded', [
+                Log::warning('PayPal: Capture rate limit exceeded', [
                     'ip' => request()->ip(),
                     'reservation_id' => $reservation->id,
                 ]);
@@ -172,12 +217,23 @@ class PaypalPaymentGateway implements PaymentInterface
 
             // SECURITY: Get order details FIRST to validate reference_id BEFORE capturing payment
             // This ensures we don't capture payment for a mismatched reservation
+            Log::info('PayPal: Retrieving order for validation', [
+                'reservation_id' => $reservation->id,
+                'token' => $token,
+            ]);
+
             try {
                 $orderResponse = $ordersController->getOrder(['id' => $token]);
                 $order = $orderResponse->getResult();
+
+                Log::info('PayPal: Order retrieved successfully', [
+                    'reservation_id' => $reservation->id,
+                    'token' => $token,
+                    'order_status' => is_array($order) ? ($order['status'] ?? null) : $order->getStatus(),
+                ]);
             } catch (\Exception $e) {
                 // Don't penalize for PayPal API failures - not a security event
-                Log::error('PayPal order retrieval failed', [
+                Log::error('PayPal: Order retrieval failed', [
                     'token' => $token,
                     'reservation_id' => $reservation->id,
                     'error' => $e->getMessage(),
@@ -191,7 +247,7 @@ class PaypalPaymentGateway implements PaymentInterface
 
             $purchaseUnits = $order->getPurchaseUnits();
             if (empty($purchaseUnits)) {
-                Log::error('PayPal order missing purchase units', [
+                Log::error('PayPal: Order missing purchase units', [
                     'token' => $token,
                     'reservation_id' => $reservation->id,
                 ]);
@@ -209,7 +265,7 @@ class PaypalPaymentGateway implements PaymentInterface
                 $rateLimiter->hit($rateLimitKey, 300);
                 $rateLimiter->hit($rateLimitKey, 300);
 
-                Log::warning('PayPal order reference_id mismatch - payment NOT captured', [
+                Log::warning('PayPal: Order reference_id mismatch - payment NOT captured', [
                     'reservation_id' => $reservation->id,
                     'order_reference_id' => $referenceId,
                     'ip' => request()->ip(),
@@ -225,12 +281,23 @@ class PaypalPaymentGateway implements PaymentInterface
             $rateLimiter->hit($rateLimitKey, 60);
 
             // Now safe to capture - order is validated
+            Log::info('PayPal: Capturing order', [
+                'reservation_id' => $reservation->id,
+                'token' => $token,
+            ]);
+
             try {
                 $response = $ordersController->captureOrder(['id' => $token]);
                 $result = $response->getResult();
+
+                Log::info('PayPal: Capture response received', [
+                    'reservation_id' => $reservation->id,
+                    'token' => $token,
+                    'result_type' => is_array($result) ? 'array' : get_class($result),
+                ]);
             } catch (\Exception $e) {
                 // Don't penalize for PayPal API failures - not a security event
-                Log::error('PayPal capture failed', [
+                Log::error('PayPal: Capture failed', [
                     'token' => $token,
                     'reservation_id' => $reservation->id,
                     'error' => $e->getMessage(),
@@ -242,16 +309,33 @@ class PaypalPaymentGateway implements PaymentInterface
                 ];
             }
 
-            if ($result->getStatus() === 'COMPLETED') {
+            // Handle both object and array responses from PayPal SDK
+            $status = is_array($result) ? ($result['status'] ?? null) : $result->getStatus();
+
+            Log::info('PayPal: Capture status', [
+                'reservation_id' => $reservation->id,
+                'token' => $token,
+                'status' => $status,
+            ]);
+
+            if ($status === 'COMPLETED') {
                 // Success - clear the rate limit for this IP
                 $rateLimiter->clear($rateLimitKey);
 
-                $resultPurchaseUnits = $result->getPurchaseUnits();
-                $payments = $resultPurchaseUnits[0]?->getPayments();
-                $captures = $payments?->getCaptures();
+                $resultPurchaseUnits = is_array($result)
+                    ? ($result['purchase_units'] ?? [])
+                    : $result->getPurchaseUnits();
+
+                $payments = is_array($resultPurchaseUnits[0] ?? null)
+                    ? ($resultPurchaseUnits[0]['payments'] ?? null)
+                    : ($resultPurchaseUnits[0]?->getPayments());
+
+                $captures = is_array($payments)
+                    ? ($payments['captures'] ?? [])
+                    : ($payments?->getCaptures());
 
                 if (empty($resultPurchaseUnits) || empty($captures)) {
-                    Log::error('PayPal capture response missing expected data', [
+                    Log::error('PayPal: Capture response missing expected data', [
                         'token' => $token,
                         'reservation_id' => $reservation->id,
                         'has_purchase_units' => ! empty($resultPurchaseUnits),
@@ -264,9 +348,17 @@ class PaypalPaymentGateway implements PaymentInterface
                     ];
                 }
 
-                $captureId = $captures[0]->getId();
+                $captureId = is_array($captures[0] ?? null)
+                    ? ($captures[0]['id'] ?? null)
+                    : $captures[0]->getId();
 
                 $reservation->update(['payment_id' => $captureId]);
+
+                Log::info('PayPal: Payment captured successfully', [
+                    'reservation_id' => $reservation->id,
+                    'capture_id' => $captureId,
+                    'token' => $token,
+                ]);
 
                 return [
                     'status' => true,
@@ -274,13 +366,28 @@ class PaypalPaymentGateway implements PaymentInterface
                 ];
             }
 
-            if ($result->getStatus() === 'PENDING') {
+            if ($status === 'PENDING') {
+                Log::info('PayPal: Payment pending', [
+                    'reservation_id' => $reservation->id,
+                    'token' => $token,
+                ]);
+
                 return [
                     'status' => 'pending',
                     'reservation' => $reservation->toArray(),
                 ];
             }
+
+            Log::warning('PayPal: Unexpected capture status', [
+                'reservation_id' => $reservation->id,
+                'token' => $token,
+                'status' => $status,
+            ]);
         }
+
+        Log::warning('PayPal: Redirect back without token', [
+            'reservation_id' => $reservation->id,
+        ]);
 
         return [
             'status' => false,
@@ -298,22 +405,34 @@ class PaypalPaymentGateway implements PaymentInterface
         $payload = $request->getContent();
         $data = json_decode($payload, true);
 
+        Log::info('PayPal: Webhook received', [
+            'event_type' => $data['event_type'] ?? 'unknown',
+            'event_id' => $data['id'] ?? null,
+            'resource_type' => $data['resource_type'] ?? null,
+        ]);
+
         if (! $data) {
-            Log::warning('PayPal webhook: Invalid JSON payload');
+            Log::warning('PayPal: Webhook invalid JSON payload');
             abort(403);
         }
 
         // SECURITY: Verify webhook signature FIRST before any database operations
         // This prevents enumeration attacks and ensures we only process authentic PayPal webhooks
+        Log::info('PayPal: Verifying webhook signature');
+
         try {
             $isValid = $this->webhookVerifier->verify($request, $payload);
 
             if (! $isValid) {
-                Log::warning('PayPal webhook: Invalid signature');
+                Log::warning('PayPal: Webhook signature invalid');
                 abort(403);
             }
+
+            Log::info('PayPal: Webhook signature verified successfully');
         } catch (\Exception $e) {
-            Log::error('PayPal webhook signature verification failed: '.$e->getMessage());
+            Log::error('PayPal: Webhook signature verification failed', [
+                'error' => $e->getMessage(),
+            ]);
             abort(403);
         }
 
@@ -321,13 +440,19 @@ class PaypalPaymentGateway implements PaymentInterface
         $eventType = $data['event_type'] ?? null;
 
         if (! in_array($eventType, ['PAYMENT.CAPTURE.COMPLETED', 'PAYMENT.CAPTURE.DENIED', 'PAYMENT.CAPTURE.REFUNDED'])) {
+            Log::info('PayPal: Webhook event type not handled', [
+                'event_type' => $eventType,
+            ]);
+
             return response()->json([], 200);
         }
 
         $captureId = $data['resource']['id'] ?? null;
 
         if (! $captureId) {
-            Log::warning('PayPal webhook: Missing capture ID');
+            Log::warning('PayPal: Webhook missing capture ID', [
+                'event_type' => $eventType,
+            ]);
 
             return response()->json([], 200);
         }
@@ -335,18 +460,42 @@ class PaypalPaymentGateway implements PaymentInterface
         $reservation = Reservation::findByPaymentId($captureId)->first();
 
         if (! $reservation) {
-            Log::info('PayPal: Reservation not found for capture id '.$captureId);
+            Log::info('PayPal: Webhook reservation not found for capture ID', [
+                'capture_id' => $captureId,
+                'event_type' => $eventType,
+            ]);
 
             return response()->json([], 200);
         }
 
+        Log::info('PayPal: Webhook processing', [
+            'event_type' => $eventType,
+            'capture_id' => $captureId,
+            'reservation_id' => $reservation->id,
+            'reservation_status' => $reservation->status->value ?? $reservation->status,
+        ]);
+
         if ($reservation->status === ReservationStatus::CONFIRMED) {
+            Log::info('PayPal: Webhook skipped - reservation already confirmed', [
+                'reservation_id' => $reservation->id,
+                'capture_id' => $captureId,
+            ]);
+
             return response()->json([], 200);
         }
 
         if ($eventType === 'PAYMENT.CAPTURE.COMPLETED') {
+            Log::info('PayPal: Dispatching ReservationConfirmed event', [
+                'reservation_id' => $reservation->id,
+                'capture_id' => $captureId,
+            ]);
             ReservationConfirmed::dispatch($reservation);
         } else {
+            Log::info('PayPal: Dispatching ReservationCancelled event', [
+                'reservation_id' => $reservation->id,
+                'capture_id' => $captureId,
+                'event_type' => $eventType,
+            ]);
             ReservationCancelled::dispatch($reservation);
         }
 
