@@ -13,7 +13,7 @@
     "require": {
         "php": "^8.2",
         "paypal/paypal-server-sdk": "^2.1",
-        "reachweb/statamic-resrv": "^5.0",
+        "reachweb/statamic-resrv": "^5.0 || dev-main",
         "statamic/cms": "^5.0"
     },
     "require-dev": {
