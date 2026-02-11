@@ -144,9 +144,9 @@ class PaypalPaymentGateway implements PaymentInterface
 
     public function handleRedirectBack(): array
     {
-        // With JS SDK flow, the user is redirected here after successful capture
-        // The capture was already done by the JS SDK calling our capture endpoint
-        // We just need to verify the reservation has a valid payment_id (capture ID)
+        if ($pending = $this->handlePaymentPending()) {
+            return $pending;
+        }
 
         $id = request()->input('id');
         $cancelled = request()->input('cancelled');
@@ -196,7 +196,16 @@ class PaypalPaymentGateway implements PaymentInterface
 
     public function handlePaymentPending(): bool|array
     {
-        return false;
+        if (! request()->has('payment_pending')) {
+            return false;
+        }
+
+        $reservation = Reservation::find(request()->input('payment_pending'));
+
+        return [
+            'status' => 'pending',
+            'reservation' => $reservation ? $reservation->toArray() : [],
+        ];
     }
 
     public function verifyPayment($request)
