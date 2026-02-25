@@ -238,8 +238,10 @@ Alpine.data('paypalPayment', () => ({
         this.errors = false;
 
         try {
-            await this.cardFields.submit();
-            // onApprove callback will handle the rest
+            await this.cardFields.submit({
+                contingencies: ['SCA_ALWAYS']
+            });
+            // 3D Secure challenge will be shown if required, then onApprove callback handles the rest
         } catch (error) {
             console.error('Card submit error:', error);
             this.errors = error.message || 'Failed to process card payment. Please try again.';
