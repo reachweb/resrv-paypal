@@ -53,6 +53,9 @@ class PaypalCaptureController extends Controller
                 'order_id' => $orderId,
                 'reservation_id' => $reservation->id,
                 'status' => $status,
+                'http_status' => $response->getStatusCode(),
+                'result_type' => is_object($result) ? get_class($result) : gettype($result),
+                'raw_body' => $status === null ? $response->getBody() : null,
             ]);
 
             if ($status === 'COMPLETED') {

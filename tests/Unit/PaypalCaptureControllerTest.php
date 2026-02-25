@@ -95,6 +95,7 @@ class PaypalCaptureControllerTest extends TestCase
 
         $response = Mockery::mock(ApiResponse::class);
         $response->shouldReceive('getResult')->andReturn($result);
+        $response->shouldReceive('getStatusCode')->andReturn(201);
 
         $this->mockOrdersController->shouldReceive('captureOrder')
             ->with(['id' => 'ORDER-123'])
@@ -133,6 +134,8 @@ class PaypalCaptureControllerTest extends TestCase
 
         $response = Mockery::mock(ApiResponse::class);
         $response->shouldReceive('getResult')->andReturn($result);
+        $response->shouldReceive('getStatusCode')->andReturn(201);
+        $response->shouldReceive('getBody')->andReturn('{"status":"PENDING"}');
 
         $this->mockOrdersController->shouldReceive('captureOrder')
             ->with(['id' => 'ORDER-123'])

@@ -247,7 +247,16 @@ class PaypalPaymentGateway implements PaymentInterface
         // Only proceed with processing after signature is verified
         $eventType = $data['event_type'] ?? null;
 
-        if (! in_array($eventType, ['PAYMENT.CAPTURE.COMPLETED', 'PAYMENT.CAPTURE.DENIED', 'PAYMENT.CAPTURE.REFUNDED'])) {
+        $captureEvents = [
+            'PAYMENT.CAPTURE.COMPLETED',
+            'PAYMENT.CAPTURE.DECLINED',
+            'PAYMENT.CAPTURE.DENIED',
+            'PAYMENT.CAPTURE.PENDING',
+            'PAYMENT.CAPTURE.REFUNDED',
+            'PAYMENT.CAPTURE.REVERSED',
+        ];
+
+        if (! in_array($eventType, $captureEvents)) {
             Log::info('PayPal: Webhook event type not handled', [
                 'event_type' => $eventType,
             ]);
@@ -298,6 +307,11 @@ class PaypalPaymentGateway implements PaymentInterface
                 'capture_id' => $captureId,
             ]);
             ReservationConfirmed::dispatch($reservation);
+        } elseif ($eventType === 'PAYMENT.CAPTURE.PENDING') {
+            Log::info('PayPal: Capture pending - no action taken', [
+                'reservation_id' => $reservation->id,
+                'capture_id' => $captureId,
+            ]);
         } else {
             Log::info('PayPal: Dispatching ReservationCancelled event', [
                 'reservation_id' => $reservation->id,
