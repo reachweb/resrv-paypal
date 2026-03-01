@@ -54,6 +54,30 @@ class PaypalPaymentGatewayTest extends TestCase
     }
 
     #[Test]
+    public function it_returns_name(): void
+    {
+        $this->assertEquals('paypal', $this->gateway->name());
+    }
+
+    #[Test]
+    public function it_returns_label(): void
+    {
+        $this->assertEquals('PayPal', $this->gateway->label());
+    }
+
+    #[Test]
+    public function it_returns_payment_view(): void
+    {
+        $this->assertEquals('resrv-paypal::livewire.checkout-payment', $this->gateway->paymentView());
+    }
+
+    #[Test]
+    public function it_does_not_support_manual_confirmation(): void
+    {
+        $this->assertFalse($this->gateway->supportsManualConfirmation());
+    }
+
+    #[Test]
     public function it_returns_public_key(): void
     {
         $reservation = Mockery::mock(Reservation::class);

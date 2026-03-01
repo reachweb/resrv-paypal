@@ -27,6 +27,26 @@ class PaypalPaymentGateway implements PaymentInterface
 
     protected WebhookSignatureVerifier $webhookVerifier;
 
+    public function name(): string
+    {
+        return 'paypal';
+    }
+
+    public function label(): string
+    {
+        return 'PayPal';
+    }
+
+    public function paymentView(): string
+    {
+        return 'resrv-paypal::livewire.checkout-payment';
+    }
+
+    public function supportsManualConfirmation(): bool
+    {
+        return false;
+    }
+
     public function __construct(?WebhookSignatureVerifier $webhookVerifier = null)
     {
         $this->client = app(PaypalServerSdkClient::class);
@@ -264,11 +284,23 @@ class PaypalPaymentGateway implements PaymentInterface
             return response()->json([], 200);
         }
 
-        $captureId = $data['resource']['id'] ?? null;
+        // For refund events, resource.id is the refund ID — extract capture ID from links
+        if ($eventType === 'PAYMENT.CAPTURE.REFUNDED') {
+            $captureId = null;
+            foreach ($data['resource']['links'] ?? [] as $link) {
+                if (($link['rel'] ?? '') === 'up' && preg_match('#/captures/([A-Z0-9]+)$#', $link['href'] ?? '', $matches)) {
+                    $captureId = $matches[1];
+                    break;
+                }
+            }
+        } else {
+            $captureId = $data['resource']['id'] ?? null;
+        }
 
         if (! $captureId) {
             Log::warning('PayPal: Webhook missing capture ID', [
                 'event_type' => $eventType,
+                'resource_id' => $data['resource']['id'] ?? null,
             ]);
 
             return response()->json([], 200);

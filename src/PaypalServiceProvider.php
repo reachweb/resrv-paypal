@@ -30,9 +30,8 @@ class PaypalServiceProvider extends AddonServiceProvider
 
     public function bootAddon(): void
     {
-        // Register views - this allows the package to provide custom checkout-payment view
-        // The view is registered under 'statamic-resrv' namespace to override the default
-        $this->loadViewsFrom(__DIR__.'/../resources/views', 'statamic-resrv');
+        // Register views under own namespace - gateway specifies its view via paymentView()
+        $this->loadViewsFrom(__DIR__.'/../resources/views', 'resrv-paypal');
 
         // Publish config
         $this->publishes([
@@ -41,7 +40,7 @@ class PaypalServiceProvider extends AddonServiceProvider
 
         // Publish views for customization
         $this->publishes([
-            __DIR__.'/../resources/views' => resource_path('views/vendor/statamic-resrv'),
+            __DIR__.'/../resources/views' => resource_path('views/vendor/resrv-paypal'),
         ], 'resrv-paypal-views');
 
         $this->app->singleton(PaypalServerSdkClient::class, function () {

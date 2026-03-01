@@ -47,6 +47,26 @@ class PaypalCaptureController extends Controller
             $response = $ordersController->captureOrder(['id' => $orderId]);
             $result = $response->getResult();
 
+            // Handle error responses (SDK returns array for 422 errors instead of throwing)
+            if (is_array($result) && isset($result['name'])) {
+                $errorIssue = $result['details'][0]['issue'] ?? $result['name'];
+                $errorDescription = $result['details'][0]['description'] ?? $result['message'] ?? 'Unknown error';
+
+                Log::warning('PayPal: Capture denied by PayPal', [
+                    'order_id' => $orderId,
+                    'reservation_id' => $reservation->id,
+                    'http_status' => $response->getStatusCode(),
+                    'error' => $errorIssue,
+                    'description' => $errorDescription,
+                    'debug_id' => $result['debug_id'] ?? null,
+                ]);
+
+                return response()->json([
+                    'error' => 'Payment declined',
+                    'message' => 'PayPal has declined this payment. Please try a different payment method.',
+                ], 400);
+            }
+
             $status = is_array($result) ? ($result['status'] ?? null) : $result->getStatus();
 
             Log::info('PayPal: Capture response', [
@@ -54,8 +74,6 @@ class PaypalCaptureController extends Controller
                 'reservation_id' => $reservation->id,
                 'status' => $status,
                 'http_status' => $response->getStatusCode(),
-                'result_type' => is_object($result) ? get_class($result) : gettype($result),
-                'raw_body' => $status === null ? $response->getBody() : null,
             ]);
 
             if ($status === 'COMPLETED') {
