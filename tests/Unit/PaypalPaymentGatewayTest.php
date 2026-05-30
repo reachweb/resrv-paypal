@@ -14,6 +14,7 @@ use Reach\ResrvPaymentPaypal\Http\Payment\WebhookSignatureVerifier;
 use Reach\ResrvPaymentPaypal\Tests\TestCase;
 use Reach\StatamicResrv\Exceptions\RefundFailedException;
 use Reach\StatamicResrv\Models\Reservation;
+use Symfony\Component\HttpKernel\Exception\HttpException;
 
 class PaypalPaymentGatewayTest extends TestCase
 {
@@ -162,7 +163,17 @@ class PaypalPaymentGatewayTest extends TestCase
         $this->mockOrdersController->shouldReceive('createOrder')
             ->once()
             ->with(Mockery::on(function ($args) {
-                return isset($args['body']);
+                if (! isset($args['body'])) {
+                    return false;
+                }
+
+                // The reservation id must ride along as custom_id (as well as reference_id) so a
+                // capture webhook can be reconciled back to its reservation even after payment_id
+                // has been cleared by Resrv.
+                $purchaseUnit = $args['body']->getPurchaseUnits()[0];
+
+                return $purchaseUnit->getCustomId() === '123'
+                    && $purchaseUnit->getReferenceId() === '123';
             }))
             ->andReturn($response);
 
@@ -171,6 +182,23 @@ class PaypalPaymentGatewayTest extends TestCase
         // JS SDK flow: id and client_secret both contain the order ID
         $this->assertEquals('ORDER-123', $result->id);
         $this->assertEquals('ORDER-123', $result->client_secret);
+    }
+
+    #[Test]
+    public function it_cancels_payment_intent_as_a_safe_noop(): void
+    {
+        $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
+        $reservation->shouldReceive('getAttribute')->with('id')->andReturn(123);
+        $reservation->id = 123;
+
+        // PayPal has no cancel/void endpoint for an un-captured CAPTURE-intent order, so the
+        // gateway must NOT call out to PayPal — it simply lets the order expire.
+        $this->mockOrdersController->shouldNotReceive('captureOrder');
+        $this->mockPaymentsController->shouldNotReceive('refundCapturedPayment');
+
+        // Resrv relies on this never throwing (it has already cleared payment_id) and returning
+        // nothing. $paymentId here is the PayPal order id originally returned from paymentIntent().
+        $this->assertNull($this->gateway->cancelPaymentIntent('ORDER-123', $reservation));
     }
 
     #[Test]
@@ -276,7 +304,7 @@ class PaypalPaymentGatewayTest extends TestCase
             ])
         );
 
-        $this->expectException(\Symfony\Component\HttpKernel\Exception\HttpException::class);
+        $this->expectException(HttpException::class);
 
         $this->gateway->verifyPayment($request);
     }
@@ -303,7 +331,7 @@ class PaypalPaymentGatewayTest extends TestCase
             ])
         );
 
-        $this->expectException(\Symfony\Component\HttpKernel\Exception\HttpException::class);
+        $this->expectException(HttpException::class);
 
         $this->gateway->verifyPayment($request);
     }

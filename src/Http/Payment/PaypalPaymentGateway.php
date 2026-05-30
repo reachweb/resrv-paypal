@@ -73,6 +73,8 @@ class PaypalPaymentGateway implements PaymentInterface
                 )->build()
             )
                 ->referenceId((string) $reservation->id)
+                // custom_id rides onto the capture webhook (reference_id does not), so verifyPayment() can reconcile it.
+                ->customId((string) $reservation->id)
                 ->description($reservation->entry()->title)
                 ->build(),
         ])->build();
@@ -91,6 +93,16 @@ class PaypalPaymentGateway implements PaymentInterface
         $paymentIntent->client_secret = $result->getId();
 
         return $paymentIntent;
+    }
+
+    public function cancelPaymentIntent(string $paymentId, Reservation $reservation): void
+    {
+        // $paymentId is an un-captured PayPal order. The v2 Orders API has no cancel/void for
+        // CAPTURE-intent orders (they just expire), so this is a no-op we only log for traceability.
+        Log::info('PayPal: Payment intent abandoned — no action needed (un-captured order expires automatically)', [
+            'reservation_id' => $reservation->id,
+            'order_id' => $paymentId,
+        ]);
     }
 
     public function refund(Reservation $reservation)
@@ -309,10 +321,22 @@ class PaypalPaymentGateway implements PaymentInterface
         $reservation = Reservation::findByPaymentId($captureId)->first();
 
         if (! $reservation) {
-            Log::info('PayPal: Webhook reservation not found for capture ID', [
-                'capture_id' => $captureId,
-                'event_type' => $eventType,
-            ]);
+            // Stale-intent race: payment_id was cleared mid-flight, so a completed capture can't be
+            // matched. Log it (via custom_id) for manual reconciliation — do NOT confirm an abandoned reservation.
+            $referenceId = $data['resource']['custom_id'] ?? null;
+
+            if ($eventType === 'PAYMENT.CAPTURE.COMPLETED' && $referenceId) {
+                Log::warning('PayPal: Captured payment has no matching active reservation — manual reconciliation required', [
+                    'capture_id' => $captureId,
+                    'reservation_id' => $referenceId,
+                    'event_type' => $eventType,
+                ]);
+            } else {
+                Log::info('PayPal: Webhook reservation not found for capture ID', [
+                    'capture_id' => $captureId,
+                    'event_type' => $eventType,
+                ]);
+            }
 
             return response()->json([], 200);
         }
