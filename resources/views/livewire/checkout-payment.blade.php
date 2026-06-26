@@ -261,8 +261,12 @@ Alpine.data('paypalPayment', () => ({
         const result = await response.json();
 
         if (response.ok && result.status === 'COMPLETED') {
-            // Redirect to checkout completed page with reservation ID from response
-            window.location.href = this.checkoutCompletedUrl + '?id=' + result.reservationId;
+            // Redirect to the checkout-completed page. resrv_gateway lets Resrv's
+            // {{ resrv_checkout_redirect }} tag resolve THIS gateway even if the session reservation
+            // was lost/overwritten, so it never hands our return to a different gateway. It must match
+            // the gateway's config key (the default registration uses "paypal").
+            const params = new URLSearchParams({ id: result.reservationId, resrv_gateway: 'paypal' });
+            window.location.href = this.checkoutCompletedUrl + '?' + params.toString();
         } else {
             throw new Error(result.error || result.message || 'Payment capture failed');
         }

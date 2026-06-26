@@ -48,7 +48,8 @@ class WebhookSignatureVerifier
             ]);
 
         if (! $response->successful()) {
-            Log::error('PayPal webhook verification API error: '.$response->body());
+            // Log only the status — the response body can carry PayPal diagnostic identifiers.
+            Log::error('PayPal webhook verification API error', ['status' => $response->status()]);
 
             return false;
         }

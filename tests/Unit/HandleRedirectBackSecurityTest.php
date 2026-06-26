@@ -5,6 +5,8 @@ namespace Reach\ResrvPaymentPaypal\Tests\Unit;
 use Illuminate\Http\Request;
 use Mockery;
 use PaypalServerSdkLib\Controllers\OrdersController;
+use PaypalServerSdkLib\Controllers\PaymentsController;
+use PaypalServerSdkLib\Http\ApiResponse;
 use PaypalServerSdkLib\PaypalServerSdkClient;
 use PHPUnit\Framework\Attributes\RunInSeparateProcess;
 use PHPUnit\Framework\Attributes\Test;
@@ -14,12 +16,12 @@ use Reach\ResrvPaymentPaypal\Tests\TestCase;
 use Reach\StatamicResrv\Models\Reservation;
 
 /**
- * Tests for handleRedirectBack() method in JS SDK flow.
+ * Tests for handleRedirectBack() in the JS SDK flow.
  *
- * In the JS SDK flow, the capture is done by the frontend calling
- * the capture endpoint. handleRedirectBack() is called when the user
- * lands on the checkout-complete page and just verifies the payment
- * was captured (payment_id exists on reservation).
+ * The capture is performed by the frontend calling the capture endpoint, which stores the capture
+ * ID on the reservation. handleRedirectBack() runs when the customer lands on the checkout-complete
+ * page and re-verifies the capture status with PayPal (mirroring the Stripe gateway, which re-reads
+ * the PaymentIntent) rather than trusting that payment_id is merely present.
  */
 class HandleRedirectBackSecurityTest extends TestCase
 {
@@ -28,6 +30,8 @@ class HandleRedirectBackSecurityTest extends TestCase
     protected $mockClient;
 
     protected $mockOrdersController;
+
+    protected $mockPaymentsController;
 
     protected $mockWebhookVerifier;
 
@@ -39,10 +43,13 @@ class HandleRedirectBackSecurityTest extends TestCase
 
         $this->mockClient = Mockery::mock(PaypalServerSdkClient::class);
         $this->mockOrdersController = Mockery::mock(OrdersController::class);
+        $this->mockPaymentsController = Mockery::mock(PaymentsController::class);
         $this->mockWebhookVerifier = Mockery::mock(WebhookSignatureVerifier::class);
 
         $this->mockClient->shouldReceive('getOrdersController')
             ->andReturn($this->mockOrdersController);
+        $this->mockClient->shouldReceive('getPaymentsController')
+            ->andReturn($this->mockPaymentsController);
 
         $this->app->instance(PaypalServerSdkClient::class, $this->mockClient);
         $this->app->instance(WebhookSignatureVerifier::class, $this->mockWebhookVerifier);
@@ -58,9 +65,10 @@ class HandleRedirectBackSecurityTest extends TestCase
 
     #[Test]
     #[RunInSeparateProcess]
-    public function it_returns_success_when_payment_id_exists(): void
+    public function it_returns_success_when_capture_is_completed(): void
     {
         $this->setupMockReservation(123, 'CAPTURE-123');
+        $this->mockCaptureStatus('COMPLETED');
         $this->simulateRequest(['id' => 123]);
 
         $result = $this->gateway->handleRedirectBack();
@@ -72,9 +80,25 @@ class HandleRedirectBackSecurityTest extends TestCase
 
     #[Test]
     #[RunInSeparateProcess]
+    public function it_returns_failure_when_capture_is_not_completed(): void
+    {
+        $this->setupMockReservation(123, 'CAPTURE-123');
+        $this->mockCaptureStatus('PENDING');
+        $this->simulateRequest(['id' => 123]);
+
+        $result = $this->gateway->handleRedirectBack();
+
+        $this->assertFalse($result['status']);
+        $this->assertEquals(123, $result['reservation']['id']);
+    }
+
+    #[Test]
+    #[RunInSeparateProcess]
     public function it_returns_failure_when_payment_id_not_set(): void
     {
+        // No capture happened yet, so payment_id is empty and PayPal is never queried.
         $this->setupMockReservation(123, null);
+        $this->mockPaymentsController->shouldNotReceive('getCapturedPayment');
         $this->simulateRequest(['id' => 123]);
 
         $result = $this->gateway->handleRedirectBack();
@@ -87,7 +111,9 @@ class HandleRedirectBackSecurityTest extends TestCase
     #[RunInSeparateProcess]
     public function it_handles_cancelled_payment(): void
     {
+        // A cancelled payment short-circuits before any capture lookup.
         $this->setupMockReservation(123, null);
+        $this->mockPaymentsController->shouldNotReceive('getCapturedPayment');
         $this->simulateRequest(['id' => 123, 'cancelled' => 'true']);
 
         $result = $this->gateway->handleRedirectBack();
@@ -98,9 +124,25 @@ class HandleRedirectBackSecurityTest extends TestCase
 
     #[Test]
     #[RunInSeparateProcess]
+    public function it_returns_graceful_failure_when_reservation_not_found(): void
+    {
+        $this->mockReservation = Mockery::mock('alias:'.Reservation::class);
+        $this->mockReservation->shouldReceive('find')->andReturnNull();
+        $this->mockPaymentsController->shouldNotReceive('getCapturedPayment');
+        $this->simulateRequest(['id' => 999]);
+
+        $result = $this->gateway->handleRedirectBack();
+
+        $this->assertFalse($result['status']);
+        $this->assertEquals([], $result['reservation']);
+    }
+
+    #[Test]
+    #[RunInSeparateProcess]
     public function it_returns_reservation_data_on_success(): void
     {
         $this->setupMockReservation(456, 'CAPTURE-456');
+        $this->mockCaptureStatus('COMPLETED');
         $this->simulateRequest(['id' => 456]);
 
         $result = $this->gateway->handleRedirectBack();
@@ -110,27 +152,14 @@ class HandleRedirectBackSecurityTest extends TestCase
         $this->assertEquals(456, $result['reservation']['id']);
     }
 
-    #[Test]
-    #[RunInSeparateProcess]
-    public function it_returns_reservation_data_on_failure(): void
-    {
-        $this->setupMockReservation(789, null);
-        $this->simulateRequest(['id' => 789]);
-
-        $result = $this->gateway->handleRedirectBack();
-
-        $this->assertFalse($result['status']);
-        $this->assertArrayHasKey('reservation', $result);
-        $this->assertEquals(789, $result['reservation']['id']);
-    }
-
-    protected function setupMockReservation(int $id, ?string $paymentId): void
+    protected function setupMockReservation(int $id, ?string $paymentId, string $status = 'pending'): void
     {
         $this->mockReservation = Mockery::mock('alias:'.Reservation::class);
         $this->mockReservation->id = $id;
         $this->mockReservation->payment_id = $paymentId;
+        $this->mockReservation->status = $status;
 
-        $this->mockReservation->shouldReceive('findOrFail')
+        $this->mockReservation->shouldReceive('find')
             ->with($id)
             ->andReturnSelf();
 
@@ -139,8 +168,21 @@ class HandleRedirectBackSecurityTest extends TestCase
                 return [
                     'id' => $id,
                     'payment_id' => $this->mockReservation->payment_id,
+                    'status' => $this->mockReservation->status,
                 ];
             });
+    }
+
+    protected function mockCaptureStatus(string $status): void
+    {
+        $result = Mockery::mock();
+        $result->shouldReceive('getStatus')->andReturn($status);
+
+        $response = Mockery::mock(ApiResponse::class);
+        $response->shouldReceive('getResult')->andReturn($result);
+
+        $this->mockPaymentsController->shouldReceive('getCapturedPayment')
+            ->andReturn($response);
     }
 
     protected function simulateRequest(array $params): void

@@ -9,6 +9,7 @@ use PHPUnit\Framework\Attributes\Test;
 use Reach\ResrvPaymentPaypal\Http\Payment\PaypalPaymentGateway;
 use Reach\ResrvPaymentPaypal\Http\Payment\WebhookSignatureVerifier;
 use Reach\ResrvPaymentPaypal\Tests\TestCase;
+use Symfony\Component\HttpKernel\Exception\HttpException;
 
 class WebhookTest extends TestCase
 {
@@ -82,7 +83,7 @@ class WebhookTest extends TestCase
             'invalid json'
         );
 
-        $this->expectException(\Symfony\Component\HttpKernel\Exception\HttpException::class);
+        $this->expectException(HttpException::class);
 
         $gateway->verifyPayment($request);
     }
@@ -138,7 +139,7 @@ class WebhookTest extends TestCase
             ])
         );
 
-        $this->expectException(\Symfony\Component\HttpKernel\Exception\HttpException::class);
+        $this->expectException(HttpException::class);
 
         $gateway->verifyPayment($request);
     }

@@ -2,6 +2,7 @@
 
 namespace Reach\ResrvPaymentPaypal\Tests\Unit;
 
+use Illuminate\Http\Request;
 use Mockery;
 use PaypalServerSdkLib\Controllers\OrdersController;
 use PaypalServerSdkLib\Http\ApiResponse;
@@ -39,6 +40,23 @@ class PaypalCaptureControllerTest extends TestCase
         parent::tearDown();
     }
 
+    /**
+     * Build a capture request whose session owns $sessionReservationId (the value Resrv stores under
+     * 'resrv_reservation' for the in-flight checkout). Pass null to simulate no owning session.
+     */
+    protected function captureRequest(?int $sessionReservationId): Request
+    {
+        $request = Request::create('/resrv-paypal/capture/ORDER-123', 'POST');
+
+        $session = $this->app['session']->driver();
+        if ($sessionReservationId !== null) {
+            $session->put('resrv_reservation', $sessionReservationId);
+        }
+        $request->setLaravelSession($session);
+
+        return $request;
+    }
+
     #[Test]
     #[RunInSeparateProcess]
     public function it_returns_403_for_invalid_order_id(): void
@@ -52,9 +70,34 @@ class PaypalCaptureControllerTest extends TestCase
             ->andReturnNull();
 
         $controller = new PaypalCaptureController;
-        $request = new \Illuminate\Http\Request;
 
-        $response = $controller->capture($request, 'INVALID-ORDER');
+        $response = $controller->capture($this->captureRequest(123), 'INVALID-ORDER');
+
+        $this->assertEquals(403, $response->getStatusCode());
+        $this->assertEquals(['error' => 'Invalid order'], $response->getData(true));
+    }
+
+    #[Test]
+    #[RunInSeparateProcess]
+    public function it_returns_403_when_session_does_not_own_the_reservation(): void
+    {
+        // A leaked/guessed order ID captured from a different (or no) session must be rejected.
+        $this->mockReservation = Mockery::mock('alias:'.Reservation::class);
+        $reservationInstance = Mockery::mock();
+        $reservationInstance->id = 123;
+        $reservationInstance->payment_id = 'ORDER-123';
+        // Must never reach the capture call.
+        $this->mockOrdersController->shouldNotReceive('captureOrder');
+
+        $this->mockReservation->shouldReceive('findByPaymentId')
+            ->with('ORDER-123')
+            ->andReturnSelf();
+        $this->mockReservation->shouldReceive('first')
+            ->andReturn($reservationInstance);
+
+        $controller = new PaypalCaptureController;
+
+        $response = $controller->capture($this->captureRequest(999), 'ORDER-123');
 
         $this->assertEquals(403, $response->getStatusCode());
         $this->assertEquals(['error' => 'Invalid order'], $response->getData(true));
@@ -102,9 +145,8 @@ class PaypalCaptureControllerTest extends TestCase
             ->andReturn($response);
 
         $controller = new PaypalCaptureController;
-        $request = new \Illuminate\Http\Request;
 
-        $result = $controller->capture($request, 'ORDER-123');
+        $result = $controller->capture($this->captureRequest(123), 'ORDER-123');
 
         $this->assertEquals(200, $result->getStatusCode());
         $data = $result->getData(true);
@@ -142,9 +184,8 @@ class PaypalCaptureControllerTest extends TestCase
             ->andReturn($response);
 
         $controller = new PaypalCaptureController;
-        $request = new \Illuminate\Http\Request;
 
-        $result = $controller->capture($request, 'ORDER-123');
+        $result = $controller->capture($this->captureRequest(123), 'ORDER-123');
 
         $this->assertEquals(400, $result->getStatusCode());
         $data = $result->getData(true);
@@ -173,9 +214,8 @@ class PaypalCaptureControllerTest extends TestCase
             ->andThrow(new \Exception('PayPal API error'));
 
         $controller = new PaypalCaptureController;
-        $request = new \Illuminate\Http\Request;
 
-        $result = $controller->capture($request, 'ORDER-123');
+        $result = $controller->capture($this->captureRequest(123), 'ORDER-123');
 
         $this->assertEquals(500, $result->getStatusCode());
         $data = $result->getData(true);
