@@ -11,11 +11,15 @@ PayPal payment gateway add-on for [Statamic Resrv](https://github.com/reachweb/s
 
 ## Requirements
 
-- PHP 8.2+
-- Laravel 11.x
-- Statamic 5.x
-- Statamic Resrv 5.x
+- PHP 8.4+
+- Laravel 12.x or 13.x
+- Statamic 6.x
+- Statamic Resrv 6.x
 - PayPal Business Account with Advanced Credit and Debit Card Payments enabled (for card fields)
+
+> **Upgrading from Resrv 5?** This release targets Resrv's v6 multiple-payment-gateway system
+> (`PaymentInterface` now requires `name()`, `label()`, `paymentView()`, `supportsManualConfirmation()`
+> and `cancelPaymentIntent()`). Use the `^5.0` line of this package for Resrv 5.
 
 ## Installation
 
@@ -67,7 +71,11 @@ Webhooks are **mandatory** for the PayPal payment gateway. They ensure payment c
 
 1. In your PayPal Developer Dashboard, go to your application settings
 2. Navigate to **Webhooks** and click **Add Webhook**
-3. Enter your webhook URL: `https://yoursite.com/resrv/api/webhook`
+3. Enter your webhook URL:
+   - If you registered PayPal under `payment_gateways` (multiple gateways), use the **per-gateway**
+     route whose segment matches your config key: `https://yoursite.com/resrv/api/webhook/paypal`
+   - If PayPal is your single gateway (legacy `payment_gateway` key), the bare
+     `https://yoursite.com/resrv/api/webhook` route also works
 4. Subscribe to these events:
    - `PAYMENT.CAPTURE.COMPLETED`
    - `PAYMENT.CAPTURE.DENIED`
@@ -91,7 +99,27 @@ The gateway uses PayPal's [verify-webhook-signature API](https://developer.paypa
 
 ## Payment Gateway Configuration
 
-Update your `config/resrv-config.php` file to use the PayPal payment gateway:
+Register the gateway in your `config/resrv-config.php`. Resrv 6 supports multiple gateways, so the
+recommended approach is to add PayPal to the `payment_gateways` array (the array key — `paypal` here —
+is stored on each reservation and used in the per-gateway webhook URL, so keep it lowercase, stable,
+and never change it once reservations exist):
+
+```php
+'payment_gateways' => [
+    'paypal' => [
+        'class' => Reach\ResrvPaymentPaypal\Http\Payment\PaypalPaymentGateway::class,
+        'label' => 'PayPal',
+        // Optional, handled entirely by Resrv core (no gateway code changes needed):
+        // 'surcharge'     => ['type' => 'percent', 'amount' => 3],
+        // 'amount_limits' => ['min' => 5, 'max' => 2000],
+    ],
+    // 'stripe' => [
+    //     'class' => Reach\StatamicResrv\Http\Payment\StripePaymentGateway::class,
+    // ],
+],
+```
+
+If PayPal is your only gateway you can instead use the legacy singular key:
 
 ```php
 'payment_gateway' => Reach\ResrvPaymentPaypal\Http\Payment\PaypalPaymentGateway::class,
@@ -126,7 +154,7 @@ The package provides a default checkout payment view. To customize the styling o
 php artisan vendor:publish --tag=resrv-paypal-views
 ```
 
-This publishes the view to `resources/views/vendor/statamic-resrv/livewire/checkout-payment.blade.php`.
+This publishes the view to `resources/views/vendor/resrv-paypal/livewire/checkout-payment.blade.php`.
 
 You can customize:
 - Button colors and styles

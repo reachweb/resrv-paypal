@@ -25,12 +25,24 @@ class PaypalCaptureController extends Controller
             'ip' => $request->ip(),
         ]);
 
-        // Security: Verify orderId matches a pending reservation
+        // Security: the order ID is an unguessable capability token, but bind the capture to the
+        // active checkout session too so a leaked/guessed order ID can't be captured from another
+        // context. Resrv stores the in-flight reservation id under 'resrv_reservation'.
         $reservation = Reservation::findByPaymentId($orderId)->first();
 
         if (! $reservation) {
             Log::warning('PayPal: Capture attempted for unknown order', [
                 'order_id' => $orderId,
+                'ip' => $request->ip(),
+            ]);
+
+            return response()->json(['error' => 'Invalid order'], 403);
+        }
+
+        if ((string) $request->session()->get('resrv_reservation') !== (string) $reservation->id) {
+            Log::warning('PayPal: Capture attempted outside the owning checkout session', [
+                'order_id' => $orderId,
+                'reservation_id' => $reservation->id,
                 'ip' => $request->ip(),
             ]);
 

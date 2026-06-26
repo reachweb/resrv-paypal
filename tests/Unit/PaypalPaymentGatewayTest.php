@@ -8,6 +8,7 @@ use PaypalServerSdkLib\Controllers\OrdersController;
 use PaypalServerSdkLib\Controllers\PaymentsController;
 use PaypalServerSdkLib\Http\ApiResponse;
 use PaypalServerSdkLib\PaypalServerSdkClient;
+use PHPUnit\Framework\Attributes\RunInSeparateProcess;
 use PHPUnit\Framework\Attributes\Test;
 use Reach\ResrvPaymentPaypal\Http\Payment\PaypalPaymentGateway;
 use Reach\ResrvPaymentPaypal\Http\Payment\WebhookSignatureVerifier;
@@ -280,6 +281,105 @@ class PaypalPaymentGatewayTest extends TestCase
         $response = $this->gateway->verifyPayment($request);
 
         $this->assertEquals(200, $response->getStatusCode());
+    }
+
+    #[Test]
+    #[RunInSeparateProcess]
+    public function it_skips_already_confirmed_reservation_on_completed_webhook(): void
+    {
+        // Regression: status is a plain string in Resrv v6, so the "already confirmed" guard must
+        // compare against ReservationStatus::CONFIRMED->value. If it compared to the enum instance
+        // it would never match, and a duplicate COMPLETED webhook would re-attempt confirmation.
+        $this->mockWebhookVerifier->shouldReceive('verify')->once()->andReturn(true);
+
+        $reservationAlias = Mockery::mock('alias:'.Reservation::class);
+        $instance = Mockery::mock();
+        $instance->id = 123;
+        $instance->status = 'confirmed';
+        // An already-confirmed reservation must never be re-transitioned.
+        $instance->shouldNotReceive('transitionTo');
+
+        $reservationAlias->shouldReceive('findByPaymentId')->with('CAPTURE-123')->andReturnSelf();
+        $reservationAlias->shouldReceive('first')->andReturn($instance);
+
+        $request = $this->webhookRequest('PAYMENT.CAPTURE.COMPLETED', ['id' => 'CAPTURE-123']);
+
+        $response = $this->gateway->verifyPayment($request);
+
+        $this->assertEquals(200, $response->getStatusCode());
+    }
+
+    #[Test]
+    #[RunInSeparateProcess]
+    public function it_leaves_reservation_pending_on_denied_capture(): void
+    {
+        // A denied capture is a retryable failed attempt: the reservation must stay PENDING (no
+        // confirmation, no cancellation), mirroring how Stripe treats payment_intent.payment_failed.
+        $this->mockWebhookVerifier->shouldReceive('verify')->once()->andReturn(true);
+
+        $reservationAlias = Mockery::mock('alias:'.Reservation::class);
+        $instance = Mockery::mock();
+        $instance->id = 123;
+        $instance->status = 'pending';
+        $instance->shouldNotReceive('transitionTo');
+        $instance->shouldNotReceive('expire');
+
+        $reservationAlias->shouldReceive('findByPaymentId')->with('CAPTURE-123')->andReturnSelf();
+        $reservationAlias->shouldReceive('first')->andReturn($instance);
+
+        $request = $this->webhookRequest('PAYMENT.CAPTURE.DENIED', ['id' => 'CAPTURE-123']);
+
+        $response = $this->gateway->verifyPayment($request);
+
+        $this->assertEquals(200, $response->getStatusCode());
+    }
+
+    #[Test]
+    #[RunInSeparateProcess]
+    public function it_acknowledges_refund_webhook_without_changing_state(): void
+    {
+        // Refund/reversal lifecycle is owned by Resrv core; the webhook only acknowledges and must
+        // not dispatch a cancellation or transition the reservation itself.
+        $this->mockWebhookVerifier->shouldReceive('verify')->once()->andReturn(true);
+
+        $reservationAlias = Mockery::mock('alias:'.Reservation::class);
+        $instance = Mockery::mock();
+        $instance->id = 123;
+        $instance->status = 'pending';
+        $instance->shouldNotReceive('transitionTo');
+        $instance->shouldNotReceive('expire');
+
+        $reservationAlias->shouldReceive('findByPaymentId')->with('CAPTURE-123')->andReturnSelf();
+        $reservationAlias->shouldReceive('first')->andReturn($instance);
+
+        // For refund events the capture ID is resolved from the "up" link, not resource.id.
+        $request = $this->webhookRequest('PAYMENT.CAPTURE.REFUNDED', [
+            'id' => 'REFUND-999',
+            'links' => [
+                ['rel' => 'up', 'href' => 'https://api.paypal.com/v2/payments/captures/CAPTURE-123'],
+            ],
+        ]);
+
+        $response = $this->gateway->verifyPayment($request);
+
+        $this->assertEquals(200, $response->getStatusCode());
+    }
+
+    protected function webhookRequest(string $eventType, array $resource): Request
+    {
+        return Request::create(
+            '/',
+            'POST',
+            [],
+            [],
+            [],
+            ['CONTENT_TYPE' => 'application/json'],
+            json_encode([
+                'id' => 'WH-EVENT-1',
+                'event_type' => $eventType,
+                'resource' => $resource,
+            ])
+        );
     }
 
     #[Test]
