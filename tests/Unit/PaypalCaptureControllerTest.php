@@ -81,11 +81,15 @@ class PaypalCaptureControllerTest extends TestCase
     #[RunInSeparateProcess]
     public function it_returns_403_when_session_does_not_own_the_reservation(): void
     {
-        // A leaked/guessed order ID captured from a different (or no) session must be rejected.
+        // A leaked/guessed order ID for a normal (PENDING) checkout captured from a different (or
+        // no) session must be rejected.
         $this->mockReservation = Mockery::mock('alias:'.Reservation::class);
         $reservationInstance = Mockery::mock();
         $reservationInstance->id = 123;
         $reservationInstance->payment_id = 'ORDER-123';
+        // A normal checkout reservation is PENDING, never AWAITING_PAYMENT, so the pay-by-link
+        // bypass does not apply — the session guard is the only authorisation.
+        $reservationInstance->shouldReceive('isAwaitingPayment')->andReturn(false);
         // Must never reach the capture call.
         $this->mockOrdersController->shouldNotReceive('captureOrder');
 
@@ -101,6 +105,60 @@ class PaypalCaptureControllerTest extends TestCase
 
         $this->assertEquals(403, $response->getStatusCode());
         $this->assertEquals(['error' => 'Invalid order'], $response->getData(true));
+    }
+
+    #[Test]
+    #[RunInSeparateProcess]
+    public function it_captures_a_pay_by_link_manual_reservation_without_an_owning_session(): void
+    {
+        // Admin-created (manual) reservations are created viaCp, so AddReservationIdToSession never
+        // seeds 'resrv_reservation', and the customer pays through an HMAC deep link in a fresh
+        // browser. The capture must still succeed on the strength of the unguessable order ID.
+        $this->mockReservation = Mockery::mock('alias:'.Reservation::class);
+        $reservationInstance = Mockery::mock();
+        $reservationInstance->id = 123;
+        $reservationInstance->payment_id = 'ORDER-123';
+        $reservationInstance->shouldReceive('isAwaitingPayment')->andReturn(true);
+        $reservationInstance->shouldReceive('update')
+            ->with(['payment_id' => 'CAPTURE-456'])
+            ->andReturn(true);
+
+        $this->mockReservation->shouldReceive('findByPaymentId')
+            ->with('ORDER-123')
+            ->andReturnSelf();
+        $this->mockReservation->shouldReceive('first')
+            ->andReturn($reservationInstance);
+
+        $capture = Mockery::mock();
+        $capture->shouldReceive('getId')->andReturn('CAPTURE-456');
+
+        $payments = Mockery::mock();
+        $payments->shouldReceive('getCaptures')->andReturn([$capture]);
+
+        $purchaseUnit = Mockery::mock();
+        $purchaseUnit->shouldReceive('getPayments')->andReturn($payments);
+
+        $result = Mockery::mock();
+        $result->shouldReceive('getStatus')->andReturn('COMPLETED');
+        $result->shouldReceive('getPurchaseUnits')->andReturn([$purchaseUnit]);
+
+        $response = Mockery::mock(ApiResponse::class);
+        $response->shouldReceive('getResult')->andReturn($result);
+        $response->shouldReceive('getStatusCode')->andReturn(201);
+
+        $this->mockOrdersController->shouldReceive('captureOrder')
+            ->with(['id' => 'ORDER-123'])
+            ->andReturn($response);
+
+        $controller = new PaypalCaptureController;
+
+        // No owning session — the manual-reservation bypass authorises the capture.
+        $result = $controller->capture($this->captureRequest(null), 'ORDER-123');
+
+        $this->assertEquals(200, $result->getStatusCode());
+        $data = $result->getData(true);
+        $this->assertEquals('COMPLETED', $data['status']);
+        $this->assertEquals('CAPTURE-456', $data['captureId']);
     }
 
     #[Test]

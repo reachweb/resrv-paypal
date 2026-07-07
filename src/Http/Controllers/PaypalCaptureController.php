@@ -25,9 +25,19 @@ class PaypalCaptureController extends Controller
             'ip' => $request->ip(),
         ]);
 
-        // Security: the order ID is an unguessable capability token, but bind the capture to the
-        // active checkout session too so a leaked/guessed order ID can't be captured from another
-        // context. Resrv stores the in-flight reservation id under 'resrv_reservation'.
+        // Security: the order ID is an unguessable capability token bound to exactly one
+        // reservation by findByPaymentId. It authorises capture in either legitimate context:
+        //
+        //  1. Normal inline checkout — the customer's session owns the in-flight reservation
+        //     (Resrv stores its id under 'resrv_reservation'). Bind to it as defence-in-depth so a
+        //     leaked/guessed order ID can't be captured from another browser context.
+        //
+        //  2. Pay-by-link for admin-created (manual) reservations — these are created viaCp, so
+        //     AddReservationIdToSession deliberately never seeds the session, and the customer
+        //     reaches the pay page through an HMAC deep link in a fresh browser. There is no
+        //     checkout session to bind to; the order ID is the capability. Only the CP manual-
+        //     reservation flow ever produces AWAITING_PAYMENT, so this never loosens the guard for
+        //     a normal PENDING checkout.
         $reservation = Reservation::findByPaymentId($orderId)->first();
 
         if (! $reservation) {
@@ -39,7 +49,9 @@ class PaypalCaptureController extends Controller
             return response()->json(['error' => 'Invalid order'], 403);
         }
 
-        if ((string) $request->session()->get('resrv_reservation') !== (string) $reservation->id) {
+        $sessionOwnsReservation = (string) $request->session()->get('resrv_reservation') === (string) $reservation->id;
+
+        if (! $sessionOwnsReservation && ! $reservation->isAwaitingPayment()) {
             Log::warning('PayPal: Capture attempted outside the owning checkout session', [
                 'order_id' => $orderId,
                 'reservation_id' => $reservation->id,
