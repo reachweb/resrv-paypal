@@ -1,5 +1,8 @@
 <div>
-    <div x-data="paypalPayment">
+    {{-- wire:ignore keeps Livewire re-renders (the pay-by-link surface re-mints the intent via
+         $wire.pay() after a terminal decline) from morphing away the PayPal SDK's injected
+         iframes; everything dynamic in this subtree is Alpine-driven. --}}
+    <div x-data="paypalPayment" wire:ignore>
         <div class="my-6 xl:my-8">
             <div class="text-lg xl:text-xl font-medium mb-2">
                 {{ trans('statamic-resrv::frontend.payment') }}
@@ -91,6 +94,10 @@ Alpine.data('paypalPayment', () => ({
     orderId: $wire.clientSecret,
     publicKey: $wire.publicKey,
     checkoutCompletedUrl: $wire.checkoutCompletedUrl,
+    // Whether the mounting Livewire component can re-mint the payment intent in place —
+    // ReservationPayment (pay-by-link) exposes pay(); the checkout surface does not (intent
+    // minting lives on the parent Checkout component, out of this view's reach).
+    canRemintInline: @js(method_exists($this, 'pay')),
     loading: false,
     errors: false,
     cardFields: null,
@@ -261,15 +268,59 @@ Alpine.data('paypalPayment', () => ({
         const result = await response.json();
 
         if (response.ok && result.status === 'COMPLETED') {
-            // Redirect to the checkout-completed page. resrv_gateway lets Resrv's
-            // {{ resrv_checkout_redirect }} tag resolve THIS gateway even if the session reservation
-            // was lost/overwritten, so it never hands our return to a different gateway. It must match
-            // the gateway's config key (the default registration uses "paypal").
-            const params = new URLSearchParams({ id: result.reservationId, resrv_gateway: 'paypal' });
-            window.location.href = this.checkoutCompletedUrl + '?' + params.toString();
+            // resrv_gateway lets Resrv's {{ resrv_checkout_redirect }} tag resolve THIS gateway
+            // even if the session reservation was lost/overwritten, so it never hands our return
+            // to a different gateway (it must match the gateway's config key; the default
+            // registration uses "paypal"). redirect_status=succeeded is the vocabulary
+            // ReservationPayment::state() reads so the pay-by-link page shows "processing"
+            // instead of re-offering payment while the webhook confirms.
+            this.redirectToCompleted({
+                id: result.reservationId,
+                resrv_gateway: 'paypal',
+                redirect_status: 'succeeded',
+            });
+        } else if (response.ok && result.status === 'PENDING') {
+            // eCheck / risk review: the capture is settling, not failed. payment_pending drives
+            // the checkout-complete page's pending message (handlePaymentPending);
+            // redirect_status=processing drives the pay-by-link page's processing state. The
+            // webhook resolves the final outcome either way.
+            this.redirectToCompleted({
+                payment_pending: result.reservationId,
+                resrv_gateway: 'paypal',
+                redirect_status: 'processing',
+            });
         } else {
-            throw new Error(result.error || result.message || 'Payment capture failed');
+            let message = result.error || result.message || 'Payment capture failed';
+
+            if (result.requiresNewOrder) {
+                // The failed capture consumed the PayPal order (and payment_id now references
+                // the dead capture), so the next attempt must run on a fresh order — retrying
+                // with the stale orderId would be rejected by the capture endpoint.
+                if (this.canRemintInline) {
+                    // Pay-by-link: pay() re-runs ReservationPayment's locked create-or-resume;
+                    // the dead capture reads as canceled, so a fresh order replaces it and the
+                    // customer can retry in place.
+                    await $wire.pay();
+                    this.orderId = $wire.clientSecret || this.orderId;
+                } else {
+                    // Checkout: reload so the customer re-enters the payment step, which mints
+                    // a fresh intent.
+                    message += ' The page will reload so you can try again.';
+                    setTimeout(() => window.location.reload(), 4000);
+                }
+            }
+
+            throw new Error(message);
         }
+    },
+
+    redirectToCompleted(params) {
+        // checkoutCompletedUrl may already carry a query string — the pay-by-link page's
+        // ?ref=&hash= HMAC pair — so parameters are appended via the URL API; a bare '?' concat
+        // would corrupt the hash and bounce a paid customer to the link-failed notice.
+        const url = new URL(this.checkoutCompletedUrl, window.location.origin);
+        Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
+        window.location.href = url.toString();
     }
 }));
 </script>

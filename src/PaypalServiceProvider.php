@@ -56,6 +56,10 @@ class PaypalServiceProvider extends AddonServiceProvider
                         ? Environment::PRODUCTION
                         : Environment::SANDBOX
                 )
+                // The SDK default is no timeout. refund() runs inside the REFUNDED status
+                // transition's row lock, so a PayPal brownout must not pin the reservation
+                // row (and a DB connection) indefinitely.
+                ->timeout(15)
                 ->build();
         });
     }

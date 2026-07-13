@@ -8,7 +8,7 @@ PayPal payment gateway add-on for [Statamic Resrv](https://github.com/reachweb/s
 
 ## Technology Stack
 
-- PHP 8.2+, Laravel 11.x, Statamic 5.x
+- PHP 8.4+, Laravel 12.x/13.x, Statamic 6.x, Statamic Resrv 6.x (multiple payment gateways)
 - `paypal/paypal-server-sdk` v2.1+ (Orders API v2, Payments API v2)
 - PayPal JavaScript SDK (buttons + card-fields components)
 
@@ -26,17 +26,20 @@ composer install          # Install dependencies
 
 [PaypalPaymentGateway.php](src/Http/Payment/PaypalPaymentGateway.php) implements `Reach\StatamicResrv\Http\Payment\PaymentInterface`:
 
-- `paymentIntent($payment, $reservation, $data)` - Creates PayPal Order, returns `stdClass` with `id` and `client_secret` (both contain order ID for JS SDK)
+- `name()` / `label()` / `paymentView()` / `supportsManualConfirmation()` / `supportsAutomaticRefunds()` - Identity methods for Resrv's multiple-gateway system (`supportsAutomaticRefunds()` returns `true`, enabling customer self-cancellation)
+- `paymentIntent($payment, $reservation, $data, $returnUrl = null)` - Creates PayPal Order, returns `stdClass` with `id` and `client_secret` (both contain order ID for JS SDK); the reservation id rides along as `custom_id` for stale-intent webhook reconciliation. `$returnUrl` (optional 4th param, Step 12) is ignored — inline gateway sets its redirect target via the `checkoutCompletedUrl` Livewire property
+- `retrievePaymentIntent($paymentId, $reservation)` - Resumes an interrupted payment (used by the manual pay-by-link page) by fetching the PayPal Order; if `payment_id` has already flipped to a capture ID it reports a live/settling capture as succeeded/processing (never minting a duplicate order) and a terminal DECLINED/FAILED capture as canceled (so the caller replaces it and the customer can retry). Returns `null` only when the intent is genuinely gone; transient API failures propagate
+- `cancelPaymentIntent($paymentId, $reservation)` - No-op (un-captured CAPTURE-intent orders have no void endpoint and expire on their own)
 - `redirectsForPayment()` - Returns `false` (payment handled inline via JS SDK)
-- `handleRedirectBack()` - Verifies payment was captured by checking `payment_id` exists on reservation
-- `refund($reservation)` - Refunds via PayPal Payments API using stored capture ID
-- `verifyPayment($request)` - Handles webhook events with signature verification, dispatches `ReservationConfirmed` or `ReservationCancelled`
+- `handleRedirectBack()` - Re-verifies the stored capture with PayPal to show an accurate immediate result (the webhook remains the source of truth)
+- `refund($reservation)` - Full-capture refund (payment + surcharge) via PayPal Payments API with a stable `PayPal-Request-Id` idempotency key; an already-fully-refunded capture reconciles to success; every failure surfaces as `RefundFailedException` (runs inside the REFUNDED transition's row lock)
+- `verifyPayment($request)` - Verifies webhook signature first, guards against stale intents / orphaned charges / amount mismatches, then confirms via `transitionTo(CONFIRMED, tolerant: true)` and dispatches `ReservationConfirmed` with `VIA_WEBHOOK` context
 
 ### PayPal Capture Controller
 
 [PaypalCaptureController.php](src/Http/Controllers/PaypalCaptureController.php) handles capture requests from the JS SDK:
 
-- `POST /resrv-paypal/capture/{orderId}` - Validates order belongs to reservation, captures via PayPal API, stores capture ID
+- `POST /resrv-paypal/capture/{orderId}` - Validates order belongs to reservation, captures via PayPal API, stores capture ID. Authorized by the owning checkout session, or sessionless for pay-by-link manual reservations (`AWAITING_PAYMENT` with an unexpired `hold_expires_at` — mirroring the pay page's deadline guard, since the lapsed-hold sweep can lag). The response branches on the CAPTURE's own status, not the order's (a COMPLETED order can carry a DECLINED or PENDING capture): COMPLETED → success, PENDING (eCheck/risk review) → pending redirect, DECLINED/FAILED → declined with `requiresNewOrder: true` (the order is consumed — the blade re-mints in place via `$wire.pay()` on pay-by-link, or reloads on checkout so the payment step re-mints); the capture ID is stored for all three so the webhook and `retrievePaymentIntent()` key on it
 
 ### Frontend View
 
@@ -48,8 +51,8 @@ composer install          # Install dependencies
 ### PayPal SDK Client
 
 [PaypalServiceProvider.php](src/PaypalServiceProvider.php) registers:
-- Singleton `PaypalServerSdkClient` configured from `config/services.paypal`
-- Views under `statamic-resrv` namespace to override default checkout-payment view
+- Singleton `PaypalServerSdkClient` configured from `config/services.paypal`, with a 15s HTTP timeout (refund runs inside a DB row lock; the SDK default is no timeout)
+- Views under the `resrv-paypal` namespace; the gateway points Resrv at them via `paymentView()`
 
 ### Payment Flow (JS SDK)
 
@@ -73,9 +76,10 @@ Webhooks are mandatory. [WebhookSignatureVerifier.php](src/Http/Payment/WebhookS
 
 ### Webhook Events
 
-- `PAYMENT.CAPTURE.COMPLETED` - Confirms reservation
-- `PAYMENT.CAPTURE.DENIED` - Cancels reservation
-- `PAYMENT.CAPTURE.REFUNDED` - Handled for refund notifications
+- `PAYMENT.CAPTURE.COMPLETED` - Confirms reservation (via `transitionTo`, with stale-intent/orphan/amount guards)
+- `PAYMENT.CAPTURE.DENIED` / `DECLINED` - Failed attempt is retryable; reservation stays PENDING
+- `PAYMENT.CAPTURE.PENDING` - Reservation stays PENDING until a later COMPLETED/DENIED resolves it
+- `PAYMENT.CAPTURE.REFUNDED` / `REVERSED` - Acknowledged only; Resrv core owns the refund lifecycle
 
 ## Environment Variables
 
@@ -88,10 +92,9 @@ PAYPAL_WEBHOOK_ID=        # Required - webhook signature verification will fail 
 
 ## Key Implementation Notes
 
-- Uses `HandlesStatamicQueries` trait for `getCheckoutCompleteEntry()`
 - Amount formatting uses Resrv's `$payment->format()` method (string with 2 decimals)
 - Currency from `config('resrv-config.currency_isoCode')`
-- Capture ID stored in `reservation.payment_id` for refunds
+- Capture ID stored in `reservation.payment_id` for refunds; refunds send an empty body (full refund of the capture — never a partial `payment`-only amount, which would strand the surcharge)
 - Webhook verification uses Laravel's `Http` facade to call PayPal's verify-webhook-signature API
 - Card Fields require Advanced Credit and Debit Card Payments (ACDC) enabled on PayPal account
-- View registered under `statamic-resrv` namespace to override Resrv's default checkout-payment view
+- Register the gateway under `payment_gateways` in `config/resrv-config.php`; the config key doubles as the per-gateway webhook URL segment (`/resrv/api/webhook/paypal`)

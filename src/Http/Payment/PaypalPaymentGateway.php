@@ -3,8 +3,9 @@
 namespace Reach\ResrvPaymentPaypal\Http\Payment;
 
 use Illuminate\Support\Facades\Log;
+use PaypalServerSdkLib\Exceptions\ApiException;
+use PaypalServerSdkLib\Exceptions\ErrorException;
 use PaypalServerSdkLib\Models\Builders\AmountWithBreakdownBuilder;
-use PaypalServerSdkLib\Models\Builders\MoneyBuilder;
 use PaypalServerSdkLib\Models\Builders\OrderRequestBuilder;
 use PaypalServerSdkLib\Models\Builders\PurchaseUnitRequestBuilder;
 use PaypalServerSdkLib\Models\Builders\RefundRequestBuilder;
@@ -15,13 +16,11 @@ use Reach\StatamicResrv\Events\ReservationConfirmed;
 use Reach\StatamicResrv\Exceptions\RefundFailedException;
 use Reach\StatamicResrv\Facades\Price;
 use Reach\StatamicResrv\Http\Payment\PaymentInterface;
-use Reach\StatamicResrv\Livewire\Traits\HandlesStatamicQueries;
 use Reach\StatamicResrv\Mail\OrphanedPaymentNotification;
 use Reach\StatamicResrv\Models\Reservation;
 
 class PaypalPaymentGateway implements PaymentInterface
 {
-    use HandlesStatamicQueries;
     use PaypalApiTrait;
 
     protected PaypalServerSdkClient $client;
@@ -48,14 +47,23 @@ class PaypalPaymentGateway implements PaymentInterface
         return false;
     }
 
+    public function supportsAutomaticRefunds(): bool
+    {
+        return true;
+    }
+
     public function __construct(?WebhookSignatureVerifier $webhookVerifier = null)
     {
         $this->client = app(PaypalServerSdkClient::class);
         $this->webhookVerifier = $webhookVerifier ?? app(WebhookSignatureVerifier::class);
     }
 
-    public function paymentIntent($payment, Reservation $reservation, $data)
+    public function paymentIntent($payment, Reservation $reservation, $data, ?string $returnUrl = null)
     {
+        // Inline gateway — $returnUrl is ignored (declared only to model the optional-return-URL
+        // convention for redirect gateways; see UPGRADE-PAYMENT-GATEWAYS.md Step 12). The JS SDK
+        // sets the post-payment redirect target from the Livewire checkoutCompletedUrl property,
+        // which Resrv already points at the right surface (checkout-complete or pay-by-link).
         Log::info('PayPal: Creating order for JS SDK', [
             'reservation_id' => $reservation->id,
             'amount' => $payment->format(),
@@ -96,6 +104,94 @@ class PaypalPaymentGateway implements PaymentInterface
         return $paymentIntent;
     }
 
+    /**
+     * Fetch the reservation's stored intent so an interrupted payment resumes on the same order
+     * instead of minting (and risking a double-charge with) a second one. Used by Resrv's
+     * pay-by-link page for manual reservations (HandlesDirectGatewayPayment). Returns null when
+     * the intent is genuinely gone, so the caller creates a fresh one.
+     *
+     * The returned object mirrors paymentIntent()'s JS-SDK shape (id + client_secret both carry
+     * the order id) plus a ->status mapped onto the vocabulary the caller's resume logic reads:
+     * 'succeeded'/'processing' short-circuit resume (money already moving — do not mint another),
+     * 'canceled' forces a fresh intent, and anything else means "still payable — resume it".
+     */
+    public function retrievePaymentIntent(string $paymentId, Reservation $reservation): ?object
+    {
+        try {
+            $result = $this->client->getOrdersController()
+                ->getOrder(['id' => $paymentId])
+                ->getResult();
+        } catch (ApiException $exception) {
+            // A 404 means $paymentId is not an order id. PayPal's payment_id flips from the order
+            // id to the capture id the moment PaypalCaptureController captures — before the webhook
+            // confirms — and the pay-by-link page redirects the customer straight back here. So
+            // before reporting the intent as gone (which would mint a SECOND order and let an
+            // already-paid customer pay twice), check whether it is now a live capture.
+            if ($exception->getCode() === 404) {
+                return $this->capturedPaymentAsIntent($paymentId);
+            }
+
+            // Transient failure (timeout, 429, 5xx, auth): propagate so a brownout on this read
+            // never replaces a still-payable order with a second one.
+            throw $exception;
+        }
+
+        $status = is_array($result) ? ($result['status'] ?? null) : $result->getStatus();
+
+        // COMPLETED (already captured) and VOIDED (dead) short-circuit resume; every other order
+        // status (CREATED/SAVED/APPROVED/PAYER_ACTION_REQUIRED) is still payable, so the same
+        // order id is handed back to the JS SDK to finish.
+        return $this->intentForResume($paymentId, match ($status) {
+            'COMPLETED' => 'succeeded',
+            'VOIDED' => 'canceled',
+            default => 'requires_payment_method',
+        });
+    }
+
+    /**
+     * Resolve a payment_id that is no longer an order id as a capture. A stored capture id
+     * usually means the customer already paid and only the confirming webhook is outstanding, so
+     * money-adjacent statuses report succeeded/processing and the caller never mints a duplicate
+     * order. DECLINED and FAILED are the exception: they are terminal at PayPal — that capture
+     * can never complete and no money moved — so they map to canceled, telling the caller to
+     * replace the intent with a fresh order (mirroring the webhook's DENIED/DECLINED stance that
+     * a failed attempt is retryable) instead of parking the customer on a permanent "processing".
+     * Returns null when it is neither an order nor a capture (genuinely gone); transient
+     * failures propagate.
+     */
+    protected function capturedPaymentAsIntent(string $paymentId): ?object
+    {
+        try {
+            $result = $this->client->getPaymentsController()
+                ->getCapturedPayment(['captureId' => $paymentId])
+                ->getResult();
+        } catch (ApiException $exception) {
+            if ($exception->getCode() === 404) {
+                return null;
+            }
+
+            throw $exception;
+        }
+
+        $status = is_array($result) ? ($result['status'] ?? null) : $result->getStatus();
+
+        return $this->intentForResume($paymentId, match ($status) {
+            'COMPLETED' => 'succeeded',
+            'DECLINED', 'FAILED' => 'canceled',
+            default => 'processing',
+        });
+    }
+
+    protected function intentForResume(string $paymentId, string $status): object
+    {
+        $intent = new \stdClass;
+        $intent->id = $paymentId;
+        $intent->client_secret = $paymentId;
+        $intent->status = $status;
+
+        return $intent;
+    }
+
     public function cancelPaymentIntent(string $paymentId, Reservation $reservation): void
     {
         // $paymentId is an un-captured PayPal order. The v2 Orders API has no cancel/void for
@@ -108,46 +204,60 @@ class PaypalPaymentGateway implements PaymentInterface
 
     public function refund(Reservation $reservation)
     {
-        Log::info('PayPal: Initiating refund', [
-            'reservation_id' => $reservation->id,
-            'capture_id' => $reservation->payment_id,
-            'amount' => $reservation->payment->format(),
-            'currency' => config('resrv-config.currency_isoCode'),
-        ]);
-
+        // This runs inside the REFUNDED transition's database transaction (a row lock is
+        // held), so keep it down to the single provider call.
         $paymentsController = $this->client->getPaymentsController();
 
+        // An empty refund body refunds the full remaining capture — payment + surcharge,
+        // exactly what was charged and what the customer-cancellation email promises. A
+        // partial refund of only `payment` would strand the surcharge at PayPal.
+        //
+        // The stable PayPal-Request-Id makes the call idempotent: if the connection drops
+        // after PayPal processed the refund (rolling the status transition back), a retry
+        // replays the original refund instead of failing forever as already-refunded. The
+        // capture id is part of the key so a reservation that legitimately creates a second
+        // capture never replays a stale request.
         try {
             $response = $paymentsController->refundCapturedPayment([
                 'captureId' => $reservation->payment_id,
-                'body' => RefundRequestBuilder::init()
-                    ->amount(
-                        MoneyBuilder::init(
-                            config('resrv-config.currency_isoCode'),
-                            $reservation->payment->format()
-                        )->build()
-                    )
-                    ->build(),
+                'paypalRequestId' => 'resrv-refund-'.$reservation->id.'-'.$reservation->payment_id,
+                'body' => RefundRequestBuilder::init()->build(),
             ]);
 
-            $result = $response->getResult();
-
-            Log::info('PayPal: Refund completed successfully', [
-                'reservation_id' => $reservation->id,
-                'capture_id' => $reservation->payment_id,
-                'refund_id' => is_array($result) ? ($result['id'] ?? null) : $result->getId(),
-            ]);
-
-            return $result;
+            return $response->getResult();
         } catch (\Exception $exception) {
-            Log::error('PayPal: Refund failed', [
-                'reservation_id' => $reservation->id,
-                'capture_id' => $reservation->payment_id,
-                'error' => $exception->getMessage(),
-            ]);
+            // Past PayPal's idempotency window — or after an out-of-band dashboard refund —
+            // the retry is rejected as already fully refunded. The money is exactly where
+            // the caller wants it, so treat it as success: throwing would roll back the
+            // REFUNDED transition and strand a refunded charge on a live reservation.
+            if ($this->captureAlreadyFullyRefunded($exception)) {
+                return true;
+            }
 
+            // Every PayPal failure mode (validation, auth, rate limit, connection) must
+            // surface as RefundFailedException so callers roll back the status transition
+            // and show their refund-failed message instead of a 500.
             throw new RefundFailedException($exception->getMessage());
         }
+    }
+
+    /**
+     * Whether a failed refund call was rejected because the capture is already fully
+     * refunded (PayPal issue code CAPTURE_FULLY_REFUNDED on the 422 response).
+     */
+    protected function captureAlreadyFullyRefunded(\Exception $exception): bool
+    {
+        if (! $exception instanceof ErrorException) {
+            return false;
+        }
+
+        foreach ($exception->getDetails() ?? [] as $detail) {
+            if ($detail->getIssue() === 'CAPTURE_FULLY_REFUNDED') {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public function getPublicKey(Reservation $reservation)
@@ -483,12 +593,15 @@ class PaypalPaymentGateway implements PaymentInterface
             // on every availability search) can't be clobbered: it re-reads the row under a lock and
             // returns false if the row moved to an incompatible state.
             if ($reservation->transitionTo(ReservationStatus::CONFIRMED, tolerant: true)) {
-                Log::info('PayPal: Reservation confirmed', [
-                    'reservation_id' => $reservation->id,
-                    'capture_id' => $captureId,
+                // Core's LogReservationConfirmed listener records the confirmation (and the
+                // activity log stores the payment facts), so no gateway-side logging here.
+                // 'webhook' is ReservationConfirmed::VIA_WEBHOOK spelled out: the constant does
+                // not exist on Resrv 6.0.0 (still allowed by composer), where referencing it
+                // would fatal — 6.0.0 simply ignores the extra constructor arguments.
+                ReservationConfirmed::dispatch($reservation, 'webhook', [
+                    'gateway' => $reservation->payment_gateway ?: 'paypal',
+                    'payment_id' => $captureId,
                 ]);
-
-                ReservationConfirmed::dispatch($reservation);
 
                 return response()->json([], 200);
             }

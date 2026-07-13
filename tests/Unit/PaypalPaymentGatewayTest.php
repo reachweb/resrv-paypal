@@ -3,16 +3,23 @@
 namespace Reach\ResrvPaymentPaypal\Tests\Unit;
 
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Event;
 use Mockery;
 use PaypalServerSdkLib\Controllers\OrdersController;
 use PaypalServerSdkLib\Controllers\PaymentsController;
+use PaypalServerSdkLib\Exceptions\ApiException;
+use PaypalServerSdkLib\Exceptions\ErrorException;
 use PaypalServerSdkLib\Http\ApiResponse;
+use PaypalServerSdkLib\Http\HttpRequest;
+use PaypalServerSdkLib\Http\HttpResponse;
+use PaypalServerSdkLib\Models\ErrorDetails;
 use PaypalServerSdkLib\PaypalServerSdkClient;
 use PHPUnit\Framework\Attributes\RunInSeparateProcess;
 use PHPUnit\Framework\Attributes\Test;
 use Reach\ResrvPaymentPaypal\Http\Payment\PaypalPaymentGateway;
 use Reach\ResrvPaymentPaypal\Http\Payment\WebhookSignatureVerifier;
 use Reach\ResrvPaymentPaypal\Tests\TestCase;
+use Reach\StatamicResrv\Events\ReservationConfirmed;
 use Reach\StatamicResrv\Exceptions\RefundFailedException;
 use Reach\StatamicResrv\Models\Reservation;
 use Symfony\Component\HttpKernel\Exception\HttpException;
@@ -77,6 +84,14 @@ class PaypalPaymentGatewayTest extends TestCase
     public function it_does_not_support_manual_confirmation(): void
     {
         $this->assertFalse($this->gateway->supportsManualConfirmation());
+    }
+
+    #[Test]
+    public function it_supports_automatic_refunds(): void
+    {
+        // refund() moves money through PayPal's API, so customer self-cancellation may
+        // rely on it. Returning false would hide the customer cancel button entirely.
+        $this->assertTrue($this->gateway->supportsAutomaticRefunds());
     }
 
     #[Test]
@@ -186,6 +201,213 @@ class PaypalPaymentGatewayTest extends TestCase
     }
 
     #[Test]
+    public function it_ignores_a_query_string_return_url_in_payment_intent(): void
+    {
+        // Step 12: the pay-by-link surface passes a $returnUrl that already carries its
+        // ?ref=&hash= authentication pair. This inline gateway must not bake it (or any return
+        // URL) into the PayPal order — the JS SDK owns the redirect leg — so no server-side
+        // append can ever corrupt the HMAC pair.
+        $payment = Mockery::mock();
+        $payment->shouldReceive('format')->andReturn('100.00');
+
+        $entry = new \stdClass;
+        $entry->title = 'Test Reservation';
+
+        $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
+        $reservation->shouldReceive('getAttribute')->with('id')->andReturn(123);
+        $reservation->shouldReceive('entry')->andReturn($entry);
+        $reservation->id = 123;
+
+        $this->app->instance(PaypalServerSdkClient::class, $this->mockClient);
+
+        $orderResult = Mockery::mock();
+        $orderResult->shouldReceive('getId')->andReturn('ORDER-123');
+
+        $response = Mockery::mock(ApiResponse::class);
+        $response->shouldReceive('getResult')->andReturn($orderResult);
+
+        $this->mockOrdersController->shouldReceive('createOrder')
+            ->once()
+            ->with(Mockery::on(function ($args) {
+                // The only places a return URL could ride on a v2 order are the (deprecated)
+                // application context and the payment source experience context — both must
+                // stay unset.
+                return isset($args['body'])
+                    && $args['body']->getApplicationContext() === null
+                    && $args['body']->getPaymentSource() === null;
+            }))
+            ->andReturn($response);
+
+        $result = $this->gateway->paymentIntent(
+            $payment,
+            $reservation,
+            [],
+            'https://example.com/pay?ref=RSV-1&hash=abc123'
+        );
+
+        $this->assertEquals('ORDER-123', $result->id);
+        $this->assertEquals('ORDER-123', $result->client_secret);
+    }
+
+    #[Test]
+    public function it_resumes_a_still_payable_order(): void
+    {
+        // An interrupted payment whose stored order is still open must resume on the SAME order id
+        // (returned as client_secret for the JS SDK) rather than minting a second one.
+        $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
+
+        $order = Mockery::mock();
+        $order->shouldReceive('getStatus')->andReturn('APPROVED');
+
+        $response = Mockery::mock(ApiResponse::class);
+        $response->shouldReceive('getResult')->andReturn($order);
+
+        $this->mockOrdersController->shouldReceive('getOrder')
+            ->once()
+            ->with(['id' => 'ORDER-123'])
+            ->andReturn($response);
+
+        $result = $this->gateway->retrievePaymentIntent('ORDER-123', $reservation);
+
+        $this->assertEquals('ORDER-123', $result->id);
+        $this->assertEquals('ORDER-123', $result->client_secret);
+        // Any non-magic status resumes; it must not be succeeded/processing/canceled.
+        $this->assertNotContains($result->status, ['succeeded', 'processing', 'canceled']);
+    }
+
+    #[Test]
+    public function it_reports_a_completed_order_as_money_already_moving(): void
+    {
+        // A COMPLETED order was already captured, so the resume logic must treat it as "money
+        // moving" (status succeeded) and never resume it into a fresh payable intent.
+        $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
+
+        $order = Mockery::mock();
+        $order->shouldReceive('getStatus')->andReturn('COMPLETED');
+
+        $response = Mockery::mock(ApiResponse::class);
+        $response->shouldReceive('getResult')->andReturn($order);
+
+        $this->mockOrdersController->shouldReceive('getOrder')->once()->andReturn($response);
+
+        $result = $this->gateway->retrievePaymentIntent('ORDER-123', $reservation);
+
+        $this->assertEquals('succeeded', $result->status);
+    }
+
+    #[Test]
+    public function it_treats_a_captured_payment_id_as_processing_to_avoid_a_second_order(): void
+    {
+        // payment_id flips from order id to capture id once PaypalCaptureController runs, and the
+        // pay-by-link page redirects the paid customer straight back here before the webhook
+        // confirms. getOrder() 404s on a capture id — the gateway must recognise the live capture
+        // and report processing so the caller does NOT mint (and let the customer pay) a 2nd order.
+        $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
+
+        $this->mockOrdersController->shouldReceive('getOrder')
+            ->once()
+            ->with(['id' => 'CAPTURE-123'])
+            ->andThrow($this->paypalApiException(404));
+
+        $capture = Mockery::mock();
+        $capture->shouldReceive('getStatus')->andReturn('COMPLETED');
+
+        $captureResponse = Mockery::mock(ApiResponse::class);
+        $captureResponse->shouldReceive('getResult')->andReturn($capture);
+
+        $this->mockPaymentsController->shouldReceive('getCapturedPayment')
+            ->once()
+            ->with(['captureId' => 'CAPTURE-123'])
+            ->andReturn($captureResponse);
+
+        $result = $this->gateway->retrievePaymentIntent('CAPTURE-123', $reservation);
+
+        $this->assertEquals('succeeded', $result->status);
+    }
+
+    #[Test]
+    public function it_maps_terminal_capture_failures_to_canceled_and_pending_to_processing(): void
+    {
+        // A DECLINED/FAILED capture is terminal at PayPal — no money moved and that capture can
+        // never complete. Reporting processing would park the pay-by-link customer on a permanent
+        // "processing" screen; canceled tells the caller to mint a fresh order so they can retry,
+        // mirroring the webhook's DENIED/DECLINED handling. A PENDING capture (e.g. eCheck) is
+        // money settling, so it stays processing.
+        $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
+
+        $this->mockOrdersController->shouldReceive('getOrder')
+            ->times(3)
+            ->andThrow($this->paypalApiException(404));
+
+        $captureResponses = [];
+        foreach (['DECLINED', 'FAILED', 'PENDING'] as $captureStatus) {
+            $capture = Mockery::mock();
+            $capture->shouldReceive('getStatus')->andReturn($captureStatus);
+
+            $captureResponse = Mockery::mock(ApiResponse::class);
+            $captureResponse->shouldReceive('getResult')->andReturn($capture);
+
+            $captureResponses[] = $captureResponse;
+        }
+
+        $this->mockPaymentsController->shouldReceive('getCapturedPayment')
+            ->times(3)
+            ->andReturn(...$captureResponses);
+
+        $this->assertEquals('canceled', $this->gateway->retrievePaymentIntent('CAPTURE-123', $reservation)->status);
+        $this->assertEquals('canceled', $this->gateway->retrievePaymentIntent('CAPTURE-123', $reservation)->status);
+        $this->assertEquals('processing', $this->gateway->retrievePaymentIntent('CAPTURE-123', $reservation)->status);
+    }
+
+    #[Test]
+    public function it_returns_null_when_the_intent_is_neither_an_order_nor_a_capture(): void
+    {
+        // Genuinely gone (deleted / never existed): return null so the caller mints a fresh intent.
+        $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
+
+        $this->mockOrdersController->shouldReceive('getOrder')
+            ->once()
+            ->andThrow($this->paypalApiException(404));
+
+        $this->mockPaymentsController->shouldReceive('getCapturedPayment')
+            ->once()
+            ->andThrow($this->paypalApiException(404));
+
+        $this->assertNull($this->gateway->retrievePaymentIntent('GONE-123', $reservation));
+    }
+
+    #[Test]
+    public function it_propagates_transient_retrieve_failures_instead_of_replacing_the_intent(): void
+    {
+        // A transient failure (here 500) must NOT be swallowed as null — that would let the caller
+        // orphan a still-payable order behind a second one on the strength of a failed read.
+        $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
+
+        $this->mockOrdersController->shouldReceive('getOrder')
+            ->once()
+            ->andThrow($this->paypalApiException(500));
+
+        $this->mockPaymentsController->shouldNotReceive('getCapturedPayment');
+
+        $this->expectException(ApiException::class);
+
+        $this->gateway->retrievePaymentIntent('ORDER-123', $reservation);
+    }
+
+    /**
+     * Build a real ApiException carrying a given HTTP status. ApiException::getCode() is final
+     * (it comes from \Exception) so it cannot be mocked — the status must flow through the
+     * constructor's response argument.
+     */
+    protected function paypalApiException(int $status): ApiException
+    {
+        $response = Mockery::mock(HttpResponse::class);
+        $response->shouldReceive('getStatusCode')->andReturn($status);
+
+        return new ApiException('PayPal API error', Mockery::mock(HttpRequest::class), $response);
+    }
+
+    #[Test]
     public function it_cancels_payment_intent_as_a_safe_noop(): void
     {
         $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
@@ -203,17 +425,14 @@ class PaypalPaymentGatewayTest extends TestCase
     }
 
     #[Test]
-    public function it_refunds_payment_with_correct_sdk_method(): void
+    public function it_refunds_the_full_capture_with_an_idempotency_key(): void
     {
-        $payment = Mockery::mock();
-        $payment->shouldReceive('format')->andReturn('100.00');
-
         // Mock the Reservation class with shouldIgnoreMissing to handle Eloquent's setAttribute
         $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
+        $reservation->shouldReceive('getAttribute')->with('id')->andReturn(123);
         $reservation->shouldReceive('getAttribute')->with('payment_id')->andReturn('CAPTURE-123');
-        $reservation->shouldReceive('getAttribute')->with('payment')->andReturn($payment);
+        $reservation->id = 123;
         $reservation->payment_id = 'CAPTURE-123';
-        $reservation->payment = $payment;
 
         $refundResult = Mockery::mock();
         $refundResult->shouldReceive('getId')->andReturn('REFUND-123');
@@ -221,11 +440,18 @@ class PaypalPaymentGatewayTest extends TestCase
         $response = Mockery::mock(ApiResponse::class);
         $response->shouldReceive('getResult')->andReturn($refundResult);
 
-        // Verify the correct method name is called
         $this->mockPaymentsController->shouldReceive('refundCapturedPayment')
             ->once()
             ->with(Mockery::on(function ($args) {
-                return $args['captureId'] === 'CAPTURE-123' && isset($args['body']);
+                // Empty refund body = full refund of the capture (payment + surcharge, exactly
+                // what was charged). Sending only `payment` would strand the surcharge at PayPal.
+                $fullRefund = isset($args['body']) && $args['body']->getAmount() === null;
+
+                // Stable per-(reservation, capture) PayPal-Request-Id so a retry after a dropped
+                // connection replays the original refund instead of double-refunding or failing.
+                $idempotent = ($args['paypalRequestId'] ?? null) === 'resrv-refund-123-CAPTURE-123';
+
+                return $args['captureId'] === 'CAPTURE-123' && $fullRefund && $idempotent;
             }))
             ->andReturn($response);
 
@@ -237,23 +463,47 @@ class PaypalPaymentGatewayTest extends TestCase
     #[Test]
     public function it_throws_refund_failed_exception_on_error(): void
     {
-        $payment = Mockery::mock();
-        $payment->shouldReceive('format')->andReturn('100.00');
-
         // Mock the Reservation class with shouldIgnoreMissing to handle Eloquent's setAttribute
         $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
+        $reservation->shouldReceive('getAttribute')->with('id')->andReturn(123);
         $reservation->shouldReceive('getAttribute')->with('payment_id')->andReturn('CAPTURE-123');
-        $reservation->shouldReceive('getAttribute')->with('payment')->andReturn($payment);
+        $reservation->id = 123;
         $reservation->payment_id = 'CAPTURE-123';
-        $reservation->payment = $payment;
 
         $this->mockPaymentsController->shouldReceive('refundCapturedPayment')
             ->once()
             ->andThrow(new \Exception('PayPal API error'));
 
         $this->expectException(RefundFailedException::class);
+        $this->expectExceptionMessage('PayPal API error');
 
         $this->gateway->refund($reservation);
+    }
+
+    #[Test]
+    public function it_treats_an_already_fully_refunded_capture_as_success(): void
+    {
+        // Past PayPal's idempotency window (or after a dashboard refund) the retry is rejected
+        // with CAPTURE_FULLY_REFUNDED. The money is already back with the customer, so refund()
+        // must succeed — throwing would roll back the REFUNDED transition and strand a refunded
+        // charge on a live reservation forever.
+        $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
+        $reservation->shouldReceive('getAttribute')->with('id')->andReturn(123);
+        $reservation->shouldReceive('getAttribute')->with('payment_id')->andReturn('CAPTURE-123');
+        $reservation->id = 123;
+        $reservation->payment_id = 'CAPTURE-123';
+
+        $detail = Mockery::mock(ErrorDetails::class);
+        $detail->shouldReceive('getIssue')->andReturn('CAPTURE_FULLY_REFUNDED');
+
+        $exception = Mockery::mock(ErrorException::class);
+        $exception->shouldReceive('getDetails')->andReturn([$detail]);
+
+        $this->mockPaymentsController->shouldReceive('refundCapturedPayment')
+            ->once()
+            ->andThrow($exception);
+
+        $this->assertTrue($this->gateway->refund($reservation));
     }
 
     #[Test]
@@ -307,6 +557,43 @@ class PaypalPaymentGatewayTest extends TestCase
         $response = $this->gateway->verifyPayment($request);
 
         $this->assertEquals(200, $response->getStatusCode());
+    }
+
+    #[Test]
+    #[RunInSeparateProcess]
+    public function it_confirms_with_webhook_context_on_completed_capture(): void
+    {
+        // The activity log distinguishes webhook confirmations from checkout ones via the
+        // event's $via/$payment arguments — a bare dispatch() would mislabel them VIA_CHECKOUT.
+        Event::fake([ReservationConfirmed::class]);
+
+        $this->mockWebhookVerifier->shouldReceive('verify')->once()->andReturn(true);
+
+        $expected = Mockery::mock();
+        $payment = Mockery::mock();
+        $payment->shouldReceive('add')->andReturn($expected);
+
+        $reservation = Mockery::mock('alias:'.Reservation::class);
+        $reservation->id = 123;
+        $reservation->status = 'pending';
+        $reservation->payment_gateway = 'paypal';
+        $reservation->payment = $payment;
+        $reservation->payment_surcharge = null;
+        $reservation->shouldReceive('findByPaymentId')->with('CAPTURE-123')->andReturnSelf();
+        $reservation->shouldReceive('first')->andReturnSelf();
+        $reservation->shouldReceive('transitionTo')->once()->andReturn(true);
+
+        $request = $this->webhookRequest('PAYMENT.CAPTURE.COMPLETED', ['id' => 'CAPTURE-123']);
+
+        $response = $this->gateway->verifyPayment($request);
+
+        $this->assertEquals(200, $response->getStatusCode());
+
+        Event::assertDispatched(
+            ReservationConfirmed::class,
+            fn ($event) => $event->via === ReservationConfirmed::VIA_WEBHOOK
+                && $event->payment === ['gateway' => 'paypal', 'payment_id' => 'CAPTURE-123']
+        );
     }
 
     #[Test]

@@ -18,8 +18,8 @@ PayPal payment gateway add-on for [Statamic Resrv](https://github.com/reachweb/s
 - PayPal Business Account with Advanced Credit and Debit Card Payments enabled (for card fields)
 
 > **Upgrading from Resrv 5?** This release targets Resrv's v6 multiple-payment-gateway system
-> (`PaymentInterface` now requires `name()`, `label()`, `paymentView()`, `supportsManualConfirmation()`
-> and `cancelPaymentIntent()`). Use the `^5.0` line of this package for Resrv 5.
+> (`PaymentInterface` now requires `name()`, `label()`, `paymentView()`, `supportsManualConfirmation()`,
+> `cancelPaymentIntent()` and `supportsAutomaticRefunds()`). Use the `^5.0` line of this package for Resrv 5.
 
 ## Installation
 
@@ -124,6 +124,19 @@ If PayPal is your only gateway you can instead use the legacy singular key:
 ```php
 'payment_gateway' => Reach\ResrvPaymentPaypal\Http\Payment\PaypalPaymentGateway::class,
 ```
+
+## Refunds & Customer Cancellations
+
+Refunds (from the Control Panel or via Resrv's customer self-cancellation feature) always return
+the **full captured amount** — the reservation payment plus any gateway surcharge, exactly what the
+customer was charged. The refund call is idempotent (a stable `PayPal-Request-Id` per reservation
+and capture), so a retry after a network failure never double-refunds; and if the capture turns out
+to be already fully refunded (e.g. refunded manually in the PayPal dashboard), the reservation is
+still marked refunded instead of getting stuck.
+
+Because the gateway reports `supportsAutomaticRefunds() === true`, customers may cancel eligible
+reservations themselves from the reservation status page when you enable Resrv's customer
+cancellation feature.
 
 ## Payment Flow
 
