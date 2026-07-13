@@ -275,24 +275,80 @@ class PaypalPaymentGatewayTest extends TestCase
         $this->assertNotContains($result->status, ['succeeded', 'processing', 'canceled']);
     }
 
-    #[Test]
-    public function it_reports_a_completed_order_as_money_already_moving(): void
+    /**
+     * Build a getOrder response mock with the given order status; when $captureStatus is
+     * non-null the order carries a single capture with that status (the drill-down
+     * retrievePaymentIntent runs for COMPLETED orders), otherwise no purchase units at all.
+     */
+    protected function mockOrderResponse(string $orderStatus, ?string $captureStatus = null): object
     {
-        // A COMPLETED order was already captured, so the resume logic must treat it as "money
-        // moving" (status succeeded) and never resume it into a fresh payable intent.
-        $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
-
         $order = Mockery::mock();
-        $order->shouldReceive('getStatus')->andReturn('COMPLETED');
+        $order->shouldReceive('getStatus')->andReturn($orderStatus);
+
+        if ($captureStatus === null) {
+            $order->shouldReceive('getPurchaseUnits')->andReturn([]);
+        } else {
+            $capture = Mockery::mock();
+            $capture->shouldReceive('getStatus')->andReturn($captureStatus);
+
+            $payments = Mockery::mock();
+            $payments->shouldReceive('getCaptures')->andReturn([$capture]);
+
+            $purchaseUnit = Mockery::mock();
+            $purchaseUnit->shouldReceive('getPayments')->andReturn($payments);
+
+            $order->shouldReceive('getPurchaseUnits')->andReturn([$purchaseUnit]);
+        }
 
         $response = Mockery::mock(ApiResponse::class);
         $response->shouldReceive('getResult')->andReturn($order);
 
-        $this->mockOrdersController->shouldReceive('getOrder')->once()->andReturn($response);
+        return $response;
+    }
+
+    #[Test]
+    public function it_reports_a_completed_order_with_a_completed_capture_as_money_already_moving(): void
+    {
+        // A COMPLETED order whose capture is COMPLETED was genuinely paid, so the resume logic
+        // must treat it as "money moving" (status succeeded) and never resume it into a fresh
+        // payable intent.
+        $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
+
+        $this->mockOrdersController->shouldReceive('getOrder')
+            ->once()
+            ->andReturn($this->mockOrderResponse('COMPLETED', 'COMPLETED'));
 
         $result = $this->gateway->retrievePaymentIntent('ORDER-123', $reservation);
 
         $this->assertEquals('succeeded', $result->status);
+    }
+
+    #[Test]
+    public function it_inspects_the_capture_inside_a_completed_order_instead_of_trusting_it(): void
+    {
+        // ORDER-level COMPLETED is not the payment outcome: the capture inside can be DECLINED
+        // or PENDING. This branch is reached when the capture controller's persist of the
+        // capture id never happened (client timeout, crash) and payment_id still holds the
+        // order id. Mapping a DECLINED capture to succeeded would strand an unpaid reservation
+        // on a permanent "processing" screen with no way to mint a replacement order — it must
+        // read canceled (fresh order, customer retries). PENDING (eCheck / risk review) and an
+        // unreadable capture stay processing: money may be settling and the webhook (via its
+        // custom_id fallback) resolves the outcome.
+        $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
+
+        $this->mockOrdersController->shouldReceive('getOrder')
+            ->times(4)
+            ->andReturn(
+                $this->mockOrderResponse('COMPLETED', 'DECLINED'),
+                $this->mockOrderResponse('COMPLETED', 'FAILED'),
+                $this->mockOrderResponse('COMPLETED', 'PENDING'),
+                $this->mockOrderResponse('COMPLETED'),
+            );
+
+        $this->assertEquals('canceled', $this->gateway->retrievePaymentIntent('ORDER-123', $reservation)->status);
+        $this->assertEquals('canceled', $this->gateway->retrievePaymentIntent('ORDER-123', $reservation)->status);
+        $this->assertEquals('processing', $this->gateway->retrievePaymentIntent('ORDER-123', $reservation)->status);
+        $this->assertEquals('processing', $this->gateway->retrievePaymentIntent('ORDER-123', $reservation)->status);
     }
 
     #[Test]
@@ -449,7 +505,11 @@ class PaypalPaymentGatewayTest extends TestCase
 
                 // Stable per-(reservation, capture) PayPal-Request-Id so a retry after a dropped
                 // connection replays the original refund instead of double-refunding or failing.
-                $idempotent = ($args['paypalRequestId'] ?? null) === 'resrv-refund-123-CAPTURE-123';
+                // The variable part is hashed: PayPal caps the header at 38 single-byte
+                // characters, which raw id concatenation overruns on 8-digit reservation ids.
+                $expectedKey = 'resrv-rf-'.substr(hash('sha256', '123-CAPTURE-123'), 0, 29);
+                $idempotent = ($args['paypalRequestId'] ?? null) === $expectedKey
+                    && strlen($args['paypalRequestId']) <= 38;
 
                 return $args['captureId'] === 'CAPTURE-123' && $fullRefund && $idempotent;
             }))

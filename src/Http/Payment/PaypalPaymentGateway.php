@@ -138,26 +138,70 @@ class PaypalPaymentGateway implements PaymentInterface
 
         $status = is_array($result) ? ($result['status'] ?? null) : $result->getStatus();
 
-        // COMPLETED (already captured) and VOIDED (dead) short-circuit resume; every other order
-        // status (CREATED/SAVED/APPROVED/PAYER_ACTION_REQUIRED) is still payable, so the same
-        // order id is handed back to the JS SDK to finish.
+        // A COMPLETED order was captured, but ORDER-level COMPLETED is not the payment outcome:
+        // the capture inside can be DECLINED (ACDC processor decline) or PENDING (eCheck / risk
+        // review) — the same split PaypalCaptureController branches on. Landing here with a
+        // COMPLETED order means the controller's capture-id persist never happened (client
+        // timeout, crash), so the capture's own status must decide: mapping a DECLINED capture
+        // to succeeded would strand an unpaid reservation on a permanent "processing" screen
+        // with no way to mint a replacement order. VOIDED is dead; every other order status
+        // (CREATED/SAVED/APPROVED/PAYER_ACTION_REQUIRED) is still payable, so the same order id
+        // is handed back to the JS SDK to finish.
         return $this->intentForResume($paymentId, match ($status) {
-            'COMPLETED' => 'succeeded',
+            'COMPLETED' => $this->captureResumeStatus($this->orderCaptureStatus($result)),
             'VOIDED' => 'canceled',
             default => 'requires_payment_method',
         });
     }
 
     /**
+     * Extract the status of a COMPLETED order's capture, mirroring PaypalCaptureController's
+     * drill-down. Null when the capture is missing/unreadable — captureResumeStatus() then
+     * reports processing, which the confirming webhook (or its custom_id fallback) resolves.
+     */
+    protected function orderCaptureStatus($order): ?string
+    {
+        $purchaseUnits = is_array($order)
+            ? ($order['purchase_units'] ?? [])
+            : ($order->getPurchaseUnits() ?? []);
+
+        $purchaseUnit = $purchaseUnits[0] ?? null;
+
+        $payments = is_array($purchaseUnit)
+            ? ($purchaseUnit['payments'] ?? null)
+            : $purchaseUnit?->getPayments();
+
+        $captures = is_array($payments)
+            ? ($payments['captures'] ?? [])
+            : ($payments?->getCaptures() ?? []);
+
+        $capture = $captures[0] ?? null;
+
+        return is_array($capture) ? ($capture['status'] ?? null) : $capture?->getStatus();
+    }
+
+    /**
+     * Map a capture status onto the caller's resume vocabulary. DECLINED and FAILED are terminal
+     * at PayPal — that capture can never complete and no money moved — so they map to canceled,
+     * telling the caller to replace the intent with a fresh order (mirroring the webhook's
+     * DENIED/DECLINED stance that a failed attempt is retryable). Everything else is money
+     * moving or settling: succeeded/processing short-circuit resume so a duplicate order is
+     * never minted.
+     */
+    protected function captureResumeStatus(?string $status): string
+    {
+        return match ($status) {
+            'COMPLETED' => 'succeeded',
+            'DECLINED', 'FAILED' => 'canceled',
+            default => 'processing',
+        };
+    }
+
+    /**
      * Resolve a payment_id that is no longer an order id as a capture. A stored capture id
-     * usually means the customer already paid and only the confirming webhook is outstanding, so
-     * money-adjacent statuses report succeeded/processing and the caller never mints a duplicate
-     * order. DECLINED and FAILED are the exception: they are terminal at PayPal — that capture
-     * can never complete and no money moved — so they map to canceled, telling the caller to
-     * replace the intent with a fresh order (mirroring the webhook's DENIED/DECLINED stance that
-     * a failed attempt is retryable) instead of parking the customer on a permanent "processing".
-     * Returns null when it is neither an order nor a capture (genuinely gone); transient
-     * failures propagate.
+     * usually means the customer already paid and only the confirming webhook is outstanding;
+     * captureResumeStatus() maps the capture's fate onto the resume vocabulary. Returns null
+     * when it is neither an order nor a capture (genuinely gone); transient failures propagate.
      */
     protected function capturedPaymentAsIntent(string $paymentId): ?object
     {
@@ -175,11 +219,7 @@ class PaypalPaymentGateway implements PaymentInterface
 
         $status = is_array($result) ? ($result['status'] ?? null) : $result->getStatus();
 
-        return $this->intentForResume($paymentId, match ($status) {
-            'COMPLETED' => 'succeeded',
-            'DECLINED', 'FAILED' => 'canceled',
-            default => 'processing',
-        });
+        return $this->intentForResume($paymentId, $this->captureResumeStatus($status));
     }
 
     protected function intentForResume(string $paymentId, string $status): object
@@ -216,11 +256,13 @@ class PaypalPaymentGateway implements PaymentInterface
         // after PayPal processed the refund (rolling the status transition back), a retry
         // replays the original refund instead of failing forever as already-refunded. The
         // capture id is part of the key so a reservation that legitimately creates a second
-        // capture never replays a stale request.
+        // capture never replays a stale request. The variable part is hashed because PayPal
+        // caps PayPal-Request-Id at 38 single-byte characters — concatenating the raw ids
+        // overruns it once the reservation id reaches eight digits.
         try {
             $response = $paymentsController->refundCapturedPayment([
                 'captureId' => $reservation->payment_id,
-                'paypalRequestId' => 'resrv-refund-'.$reservation->id.'-'.$reservation->payment_id,
+                'paypalRequestId' => $this->refundRequestId($reservation),
                 'body' => RefundRequestBuilder::init()->build(),
             ]);
 
@@ -239,6 +281,15 @@ class PaypalPaymentGateway implements PaymentInterface
             // and show their refund-failed message instead of a 500.
             throw new RefundFailedException($exception->getMessage());
         }
+    }
+
+    /**
+     * Stable per-(reservation, capture) idempotency key, kept within PayPal's 38-single-byte
+     * limit for PayPal-Request-Id: 9-char prefix + 29 hex chars of a hash over both ids.
+     */
+    protected function refundRequestId(Reservation $reservation): string
+    {
+        return 'resrv-rf-'.substr(hash('sha256', $reservation->id.'-'.$reservation->payment_id), 0, 29);
     }
 
     /**
