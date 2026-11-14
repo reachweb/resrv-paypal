@@ -8,7 +8,7 @@ PayPal payment gateway add-on for [Statamic Resrv](https://github.com/reachweb/s
 
 ## Technology Stack
 
-- PHP 8.4+, Laravel 12.x/13.x, Statamic 6.x, Statamic Resrv 6.x (multiple payment gateways)
+- PHP 8.4+, Laravel 12.x/13.x, Statamic 6.x, Statamic Resrv 6.5+ (multiple payment gateways)
 - `paypal/paypal-server-sdk` v2.1+ (Orders API v2, Payments API v2)
 - PayPal JavaScript SDK (buttons + card-fields components)
 

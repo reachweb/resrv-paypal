@@ -14,12 +14,14 @@ PayPal payment gateway add-on for [Statamic Resrv](https://github.com/reachweb/s
 - PHP 8.4+
 - Laravel 12.x or 13.x
 - Statamic 6.x
-- Statamic Resrv 6.x
+- Statamic Resrv 6.5 or later
 - PayPal Business Account with Advanced Credit and Debit Card Payments enabled (for card fields)
 
 > **Upgrading from Resrv 5?** This release targets Resrv's v6 multiple-payment-gateway system
 > (`PaymentInterface` now requires `name()`, `label()`, `paymentView()`, `supportsManualConfirmation()`,
-> `cancelPaymentIntent()` and `supportsAutomaticRefunds()`). Use the `^5.0` line of this package for Resrv 5.
+> `cancelPaymentIntent()` and `supportsAutomaticRefunds()`). Tagged releases start at v1.0.0 and need
+> Resrv 6.5 or later; there is no release for Resrv 5, so a Resrv 5 site has to stay on the last
+> compatible commit: `composer require reachweb/resrv-payment-paypal:dev-main#049bfa9`.
 
 ## Installation
 
