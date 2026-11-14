@@ -8,7 +8,8 @@ return [
     |
     | These credentials are loaded from environment variables and used to
     | authenticate with the PayPal API. You can also configure these in
-    | config/services.php under the 'paypal' key.
+    | config/services.php under the 'paypal' key; values set there take
+    | precedence over these.
     |
     */
 

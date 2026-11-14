@@ -1,0 +1,79 @@
+<?php
+
+namespace Reach\ResrvPaymentPaypal\Tests\Feature;
+
+use Livewire\Component;
+use Livewire\Livewire;
+use Livewire\LivewireServiceProvider;
+use MarcoRieser\Livewire\ServiceProvider;
+use PHPUnit\Framework\Attributes\Test;
+use Reach\ResrvPaymentPaypal\Http\Payment\PaypalPaymentGateway;
+use Reach\ResrvPaymentPaypal\PaypalServiceProvider;
+use Statamic\Testing\AddonTestCase;
+
+/**
+ * Renders the gateway's payment view the way Resrv does: inside a Livewire component exposing the
+ * properties both payment surfaces provide (CheckoutPayment for checkout, ReservationPayment for
+ * pay-by-link). Boots the add-on through Statamic's addon manifest, so the view namespace comes
+ * from bootAddon() exactly as on a real site.
+ */
+class PaymentViewRenderTest extends AddonTestCase
+{
+    protected string $addonServiceProvider = PaypalServiceProvider::class;
+
+    protected function getPackageProviders($app)
+    {
+        return array_merge(parent::getPackageProviders($app), [
+            LivewireServiceProvider::class,
+            ServiceProvider::class,
+        ]);
+    }
+
+    protected function defineEnvironment($app): void
+    {
+        $app['config']->set('app.key', 'base64:2fl+Ktvkfl+Fuz4Qp/A75G2RTiWVA/ZoKZvp6fiiM10=');
+        $app['config']->set('services.paypal.mode', 'sandbox');
+        $app['config']->set('resrv-config.currency_isoCode', 'EUR');
+    }
+
+    #[Test]
+    public function it_renders_on_the_checkout_surface(): void
+    {
+        Livewire::test(CheckoutSurfaceStub::class)
+            ->assertSeeHtml('id="paypal-button-container"')
+            ->assertSeeHtml('id="card-number-field-container"')
+            ->assertSeeHtml('currency=EUR')
+            ->assertSeeHtml('canRemintInline: false');
+    }
+
+    #[Test]
+    public function it_renders_on_the_pay_by_link_surface(): void
+    {
+        Livewire::test(PayByLinkSurfaceStub::class)
+            ->assertSeeHtml('id="paypal-button-container"')
+            ->assertSeeHtml('canRemintInline: true');
+    }
+}
+
+class CheckoutSurfaceStub extends Component
+{
+    public string $clientSecret = 'ORDER-1';
+
+    public string $publicKey = 'client-id';
+
+    public float $amount = 55.0;
+
+    public string $checkoutCompletedUrl = 'https://example.com/checkout-complete';
+
+    public function render()
+    {
+        return view((new PaypalPaymentGateway)->paymentView());
+    }
+}
+
+class PayByLinkSurfaceStub extends CheckoutSurfaceStub
+{
+    public string $checkoutCompletedUrl = 'https://example.com/pay?ref=ABC&hash=123';
+
+    public function pay(): void {}
+}

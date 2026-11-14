@@ -5,12 +5,18 @@ namespace Reach\ResrvPaymentPaypal\Http\Controllers;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use PaypalServerSdkLib\PaypalServerSdkClient;
+use Reach\ResrvPaymentPaypal\Http\Payment\PaypalApiException;
+use Reach\ResrvPaymentPaypal\Http\Payment\PaypalApiTrait;
+use Reach\StatamicResrv\Enums\ReservationStatus;
 use Reach\StatamicResrv\Models\Reservation;
 
 class PaypalCaptureController extends Controller
 {
+    use PaypalApiTrait;
+
     protected PaypalServerSdkClient $client;
 
     public function __construct()
@@ -28,19 +34,19 @@ class PaypalCaptureController extends Controller
         // Security: the order ID is an unguessable capability token bound to exactly one
         // reservation by findByPaymentId. It authorises capture in either legitimate context:
         //
-        //  1. Normal inline checkout — the customer's session owns the in-flight reservation
-        //     (Resrv stores its id under 'resrv_reservation'). Bind to it as defence-in-depth so a
-        //     leaked/guessed order ID can't be captured from another browser context.
+        //  1. Normal inline checkout — the customer's session owns the in-flight PENDING
+        //     reservation (Resrv stores its id under 'resrv_reservation'). Bind to it as
+        //     defence-in-depth so a leaked order ID can't be captured from another browser context.
         //
         //  2. Pay-by-link for admin-created (manual) reservations — these are created viaCp, so
         //     AddReservationIdToSession deliberately never seeds the session, and the customer
         //     reaches the pay page through an HMAC deep link in a fresh browser. There is no
         //     checkout session to bind to; the order ID is the capability. Only the CP manual-
         //     reservation flow ever produces AWAITING_PAYMENT, so this never loosens the guard for
-        //     a normal PENDING checkout. The bypass also mirrors the pay page's hold-deadline
-        //     guard (ReservationPayment::deadlinePassed): past hold_expires_at the reservation is
-        //     no longer payable even though the lapsed-hold sweep may not have cancelled it yet,
-        //     so a PayPal popup opened before the deadline must not capture after it.
+        //     a normal PENDING checkout. Past hold_expires_at the reservation is no longer payable
+        //     even though the lapsed-hold sweep may not have cancelled it yet
+        //     (ReservationPayment::deadlinePassed), so a popup opened before the deadline must
+        //     not capture after it.
         $reservation = Reservation::findByPaymentId($orderId)->first();
 
         if (! $reservation) {
@@ -54,162 +60,189 @@ class PaypalCaptureController extends Controller
 
         $sessionOwnsReservation = (string) $request->session()->get('resrv_reservation') === (string) $reservation->id;
 
-        if (! $sessionOwnsReservation
-            && (! $reservation->isAwaitingPayment() || $reservation->hold_expires_at?->isPast())) {
-            Log::warning('PayPal: Capture attempted outside the owning checkout session', [
-                'order_id' => $orderId,
-                'reservation_id' => $reservation->id,
-                'awaiting_payment' => $reservation->isAwaitingPayment(),
-                'hold_expires_at' => $reservation->hold_expires_at?->toIso8601String(),
-                'ip' => $request->ip(),
-            ]);
+        // The reservation row stays locked for the whole capture. PayPal has no void for
+        // CAPTURE-intent orders, so refusing here is what voids one: a transition that changes
+        // payability (admin marks paid or cancels, the lapsed-hold sweep, expiry, a checkout that
+        // replaced the intent) either commits first — and this capture is refused — or waits for
+        // it and then sees the stored capture id as money already moving. Without the lock a
+        // capture could land between Resrv verifying the "void" and its commit, unnoticed.
+        // The SDK client's 15s timeout bounds how long the lock is held, as for refunds.
+        return DB::transaction(function () use ($request, $reservation, $orderId, $sessionOwnsReservation) {
+            $fresh = Reservation::query()->lockForUpdate()->find($reservation->id);
 
-            return response()->json(['error' => 'Invalid order'], 403);
-        }
+            if (! $fresh || $fresh->payment_id !== $orderId || ! $this->mayCapture($fresh, $sessionOwnsReservation)) {
+                Log::warning('PayPal: Capture refused — order no longer payable for this request', [
+                    'order_id' => $orderId,
+                    'reservation_id' => $reservation->id,
+                    'status' => $fresh?->status,
+                    'session_owns_reservation' => $sessionOwnsReservation,
+                    'hold_expires_at' => $fresh?->hold_expires_at?->toIso8601String(),
+                    'ip' => $request->ip(),
+                ]);
 
+                return response()->json(['error' => 'Invalid order'], 403);
+            }
+
+            return $this->captureLocked($fresh, $orderId);
+        });
+    }
+
+    /**
+     * The same rule PaypalPaymentGateway::orderCanStillBeCaptured() reports to Resrv, plus the
+     * per-request binding: a PENDING checkout only from its own session, an awaiting-payment
+     * reservation only before its hold deadline.
+     */
+    protected function mayCapture(Reservation $reservation, bool $sessionOwnsReservation): bool
+    {
+        return match ($reservation->status) {
+            ReservationStatus::PENDING->value => $sessionOwnsReservation,
+            ReservationStatus::AWAITING_PAYMENT->value => ! $reservation->holdDeadlinePassed(),
+            default => false,
+        };
+    }
+
+    protected function captureLocked(Reservation $reservation, string $orderId): JsonResponse
+    {
         Log::info('PayPal: Capturing order via API', [
             'order_id' => $orderId,
             'reservation_id' => $reservation->id,
         ]);
 
         try {
-            $ordersController = $this->client->getOrdersController();
-            $response = $ordersController->captureOrder(['id' => $orderId]);
-            $result = $response->getResult();
-
-            // Handle error responses (SDK returns array for 422 errors instead of throwing)
-            if (is_array($result) && isset($result['name'])) {
-                $errorIssue = $result['details'][0]['issue'] ?? $result['name'];
-                $errorDescription = $result['details'][0]['description'] ?? $result['message'] ?? 'Unknown error';
-
-                Log::warning('PayPal: Capture denied by PayPal', [
-                    'order_id' => $orderId,
-                    'reservation_id' => $reservation->id,
-                    'http_status' => $response->getStatusCode(),
-                    'error' => $errorIssue,
-                    'description' => $errorDescription,
-                    'debug_id' => $result['debug_id'] ?? null,
-                ]);
-
-                return response()->json([
-                    'error' => 'Payment declined',
-                    'message' => 'PayPal has declined this payment. Please try a different payment method.',
-                ], 400);
+            // PayPal documents the default Prefer: return=minimal response as id, status and links
+            // only; the capture id and status live in purchase_units[].payments.captures, which
+            // only the full representation is documented to carry.
+            $order = $this->paypalResult($this->client->getOrdersController()->captureOrder([
+                'id' => $orderId,
+                'prefer' => 'return=representation',
+            ]));
+        } catch (PaypalApiException $exception) {
+            if ($exception->hasIssue('ORDER_ALREADY_CAPTURED')) {
+                // A retry after the first attempt's response was lost: that attempt captured, so
+                // report its capture instead of telling a paying customer they were declined.
+                return $this->respondWithCapturedOrder($reservation, $orderId);
             }
 
-            $status = is_array($result) ? ($result['status'] ?? null) : $result->getStatus();
-
-            Log::info('PayPal: Capture response', [
+            Log::warning('PayPal: Capture rejected by PayPal', [
                 'order_id' => $orderId,
                 'reservation_id' => $reservation->id,
-                'status' => $status,
-                'http_status' => $response->getStatusCode(),
+                'http_status' => $exception->statusCode,
+                'issues' => $exception->issues,
+                'debug_id' => $exception->debugId,
             ]);
 
-            if ($status === 'COMPLETED') {
-                // The ORDER-level COMPLETED status is not the payment outcome: PayPal can return
-                // a COMPLETED order whose capture is DECLINED (ACDC processor decline) or PENDING
-                // (eCheck / risk review), so the capture's own status decides the response.
-                $purchaseUnits = is_array($result)
-                    ? ($result['purchase_units'] ?? [])
-                    : $result->getPurchaseUnits();
-
-                $payments = is_array($purchaseUnits[0] ?? null)
-                    ? ($purchaseUnits[0]['payments'] ?? null)
-                    : ($purchaseUnits[0]?->getPayments());
-
-                $captures = is_array($payments)
-                    ? ($payments['captures'] ?? [])
-                    : ($payments?->getCaptures() ?? []);
-
-                $capture = $captures[0] ?? null;
-                $captureId = is_array($capture) ? ($capture['id'] ?? null) : $capture?->getId();
-                $captureStatus = is_array($capture) ? ($capture['status'] ?? null) : $capture?->getStatus();
-
-                if ($captureId) {
-                    // Stored for every capture outcome — the capture id is what every later actor
-                    // keys on: the webhook confirms/denies by it, and retrievePaymentIntent() maps
-                    // it to processing (PENDING) or canceled (DECLINED/FAILED) so the pay-by-link
-                    // page resumes correctly instead of reading the dead order as succeeded.
-                    $reservation->update(['payment_id' => $captureId]);
-
-                    if ($captureStatus === 'COMPLETED') {
-                        Log::info('PayPal: Payment captured successfully', [
-                            'order_id' => $orderId,
-                            'reservation_id' => $reservation->id,
-                            'capture_id' => $captureId,
-                        ]);
-
-                        return response()->json([
-                            'status' => 'COMPLETED',
-                            'captureId' => $captureId,
-                            'reservationId' => $reservation->id,
-                        ]);
-                    }
-
-                    if ($captureStatus === 'PENDING') {
-                        // Money is settling, not failed. The PAYMENT.CAPTURE.COMPLETED / DENIED
-                        // webhook resolves the outcome; the JS shows the pending surface meanwhile.
-                        Log::info('PayPal: Capture pending (eCheck / risk review)', [
-                            'order_id' => $orderId,
-                            'reservation_id' => $reservation->id,
-                            'capture_id' => $captureId,
-                        ]);
-
-                        return response()->json([
-                            'status' => 'PENDING',
-                            'captureId' => $captureId,
-                            'reservationId' => $reservation->id,
-                        ]);
-                    }
-
-                    // DECLINED/FAILED: terminal for this capture, no money moved. Unlike the 422
-                    // decline above (where the order stays capturable and the customer can simply
-                    // retry), the order here is consumed — and payment_id now references the dead
-                    // capture — so the JS must obtain a fresh order before the next attempt.
-                    Log::warning('PayPal: Capture declined inside a completed order', [
-                        'order_id' => $orderId,
-                        'reservation_id' => $reservation->id,
-                        'capture_id' => $captureId,
-                        'capture_status' => $captureStatus,
-                    ]);
-
-                    return response()->json([
-                        'error' => 'Payment declined',
-                        'message' => 'PayPal has declined this payment. Please try a different payment method.',
-                        'requiresNewOrder' => true,
-                    ], 400);
-                }
-
-                Log::warning('PayPal: Capture completed but no capture ID found', [
-                    'order_id' => $orderId,
-                    'reservation_id' => $reservation->id,
-                    'captures_count' => count($captures),
-                    'captures_data' => $captures,
-                ]);
+            // 422 is PayPal refusing this payment (INSTRUMENT_DECLINED, PAYER_ACTION_REQUIRED, ...).
+            // The order is still approvable, so the customer can retry with another method.
+            if ($exception->statusCode === 422) {
+                return $this->declined();
             }
 
+            return $this->captureFailed();
+        } catch (\Throwable $exception) {
+            // Transport failure (timeout, connection). PayPal may still have captured: a retry
+            // lands on ORDER_ALREADY_CAPTURED above, and the webhook confirms either way.
+            Log::error('PayPal: Capture API error', [
+                'order_id' => $orderId,
+                'reservation_id' => $reservation->id,
+                'error' => $exception->getMessage(),
+            ]);
+
+            return $this->captureFailed();
+        }
+
+        return $this->respondToOrder($reservation, $orderId, $order);
+    }
+
+    protected function respondWithCapturedOrder(Reservation $reservation, string $orderId): JsonResponse
+    {
+        try {
+            $order = $this->paypalResult($this->client->getOrdersController()->getOrder(['id' => $orderId]));
+        } catch (\Throwable $exception) {
+            Log::error('PayPal: Could not read an already-captured order', [
+                'order_id' => $orderId,
+                'reservation_id' => $reservation->id,
+                'error' => $exception->getMessage(),
+            ]);
+
+            return $this->captureFailed();
+        }
+
+        return $this->respondToOrder($reservation, $orderId, $order);
+    }
+
+    /**
+     * Respond from the order PayPal returned for the capture. The ORDER-level COMPLETED status is
+     * not the payment outcome: PayPal can return a COMPLETED order whose capture is DECLINED (ACDC
+     * processor decline) or PENDING (eCheck / risk review), so the capture's own status decides.
+     */
+    protected function respondToOrder(Reservation $reservation, string $orderId, $order): JsonResponse
+    {
+        $status = $order?->getStatus();
+        $capture = ($order?->getPurchaseUnits()[0] ?? null)?->getPayments()?->getCaptures()[0] ?? null;
+        $captureId = $capture?->getId();
+        $captureStatus = $capture?->getStatus();
+
+        Log::info('PayPal: Capture response', [
+            'order_id' => $orderId,
+            'reservation_id' => $reservation->id,
+            'status' => $status,
+            'capture_id' => $captureId,
+            'capture_status' => $captureStatus,
+        ]);
+
+        if ($status !== 'COMPLETED' || ! $captureId) {
             Log::warning('PayPal: Capture did not complete as expected', [
                 'order_id' => $orderId,
                 'reservation_id' => $reservation->id,
                 'status' => $status,
             ]);
 
-            return response()->json([
-                'error' => 'Capture failed',
-                'status' => $status,
-            ], 400);
-        } catch (\Exception $e) {
-            Log::error('PayPal: Capture API error', [
-                'order_id' => $orderId,
-                'reservation_id' => $reservation->id,
-                'error' => $e->getMessage(),
-            ]);
-
-            return response()->json([
-                'error' => 'Capture failed',
-                'message' => $e->getMessage(),
-            ], 500);
+            return $this->captureFailed(400);
         }
+
+        // Stored for every capture outcome — the capture id is what every later actor keys on: the
+        // webhook confirms/denies by it, and retrievePaymentIntent() maps it to processing
+        // (PENDING) or canceled (DECLINED/FAILED) so the pay-by-link page resumes correctly.
+        $reservation->update(['payment_id' => $captureId]);
+
+        if ($captureStatus === 'COMPLETED' || $captureStatus === 'PENDING') {
+            // PENDING: money is settling, not failed. The PAYMENT.CAPTURE.COMPLETED / DENIED
+            // webhook resolves the outcome; the JS shows the pending surface meanwhile.
+            return response()->json([
+                'status' => $captureStatus,
+                'captureId' => $captureId,
+                'reservationId' => $reservation->id,
+            ]);
+        }
+
+        // DECLINED/FAILED: terminal for this capture, no money moved. Unlike a 422 decline (where
+        // the order stays capturable and the customer can simply retry), the order here is
+        // consumed — and payment_id now references the dead capture — so the JS must obtain a
+        // fresh order before the next attempt.
+        Log::warning('PayPal: Capture declined inside a completed order', [
+            'order_id' => $orderId,
+            'reservation_id' => $reservation->id,
+            'capture_id' => $captureId,
+            'capture_status' => $captureStatus,
+        ]);
+
+        return $this->declined(['requiresNewOrder' => true]);
+    }
+
+    protected function declined(array $extra = []): JsonResponse
+    {
+        return response()->json([
+            'error' => 'Payment declined',
+            'message' => 'PayPal has declined this payment. Please try a different payment method.',
+            ...$extra,
+        ], 400);
+    }
+
+    protected function captureFailed(int $status = 502): JsonResponse
+    {
+        return response()->json([
+            'error' => 'Capture failed',
+            'message' => 'PayPal could not process the payment. Please try again.',
+        ], $status);
     }
 }

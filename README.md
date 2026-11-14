@@ -23,6 +23,24 @@ PayPal payment gateway add-on for [Statamic Resrv](https://github.com/reachweb/s
 > Resrv 6.5 or later; there is no release for Resrv 5, so a Resrv 5 site has to stay on the last
 > compatible commit: `composer require reachweb/resrv-payment-paypal:dev-main#049bfa9`.
 
+## Upgrading from 1.0.0
+
+v1.0.0 could not take payments: the payment view failed to render, and a refund PayPal rejected
+was still recorded as refunded. Upgrade with `composer update reachweb/resrv-payment-paypal`.
+What changes for a site:
+
+- **Published payment view:** if you ran `vendor:publish --tag=resrv-paypal-views`, re-publish it
+  (`php artisan vendor:publish --tag=resrv-paypal-views --force`) and re-apply your edits. The old
+  copy fails to render, and it returns customers to the checkout-complete page with a parameter
+  1.0.1 no longer accepts (see [Customizing the Payment View](#customizing-the-payment-view)).
+- **Refunds PayPal rejects now fail:** the Control Panel and customer self-cancellation show Resrv's
+  refund-failed message and the reservation stays confirmed, instead of being marked refunded with
+  no money returned.
+- **`config/services.php` is honoured:** values under its `paypal` key now take precedence over the
+  `PAYPAL_*` environment variables (see [API Configuration](#api-configuration)).
+- **Cancelled or paid-in-person pay-by-link bookings** no longer keep a "payment unresolved" PayPal
+  order or send admins an "open payment intent could not be cancelled" alert.
+
 ## Installation
 
 ```bash
@@ -56,6 +74,10 @@ PAYPAL_WEBHOOK_ID=your_webhook_id
 ```
 
 Set `PAYPAL_MODE` to `sandbox` for testing or `live` for production.
+
+You can configure the same four values under a `paypal` key in `config/services.php` instead
+(`client_id`, `client_secret`, `mode`, `webhook_id`). A value set there takes precedence; the
+`PAYPAL_*` environment variables fill in any it leaves out.
 
 > **Important:** For security purposes, never commit your API credentials to version control. Always use environment variables.
 
@@ -136,6 +158,11 @@ and capture), so a retry after a network failure never double-refunds; and if th
 to be already fully refunded (e.g. refunded manually in the PayPal dashboard), the reservation is
 still marked refunded instead of getting stuck.
 
+If PayPal refuses the refund (for example an insufficient PayPal balance, wrong credentials, or a
+PayPal outage), the refund fails: the Control Panel or the customer sees Resrv's refund-failed
+message, the reservation stays confirmed, and the PayPal error is logged. Nothing is marked refunded
+until PayPal accepts the refund.
+
 Because the gateway reports `supportsAutomaticRefunds() === true`, customers may cancel eligible
 reservations themselves from the reservation status page when you enable Resrv's customer
 cancellation feature.
@@ -170,6 +197,16 @@ php artisan vendor:publish --tag=resrv-paypal-views
 ```
 
 This publishes the view to `resources/views/vendor/resrv-paypal/livewire/checkout-payment.blade.php`.
+
+When you customize it, keep the script's contract with the server:
+
+- After a successful capture, return the customer to `checkoutCompletedUrl` with the
+  `capture_id` from the capture response (plus `resrv_gateway` and `redirect_status`). The
+  checkout-complete page looks the reservation up by that capture id; it does not accept a
+  reservation id.
+- Blade compiles every `{{ ... }}` in the file, including ones inside JavaScript comments, so each
+  must be a valid PHP expression; anything else (such as an Antlers tag name) makes the whole view
+  fail to render. Write `@{{ ... }}` when you need literal braces.
 
 You can customize:
 - Button colors and styles

@@ -268,14 +268,17 @@ Alpine.data('paypalPayment', () => ({
         const result = await response.json();
 
         if (response.ok && result.status === 'COMPLETED') {
-            // resrv_gateway lets Resrv's {{ resrv_checkout_redirect }} tag resolve THIS gateway
-            // even if the session reservation was lost/overwritten, so it never hands our return
-            // to a different gateway (it must match the gateway's config key; the default
-            // registration uses "paypal"). redirect_status=succeeded is the vocabulary
-            // ReservationPayment::state() reads so the pay-by-link page shows "processing"
-            // instead of re-offering payment while the webhook confirms.
+            // capture_id is what handleRedirectBack() resolves the reservation by (never the
+            // guessable reservation id). resrv_gateway lets Resrv's resrv_checkout_redirect tag
+            // resolve THIS gateway even if the session reservation was lost/overwritten, so it
+            // never hands our return to a different gateway (it must match the gateway's config
+            // key; the default registration uses "paypal"). Do not write the tag inside double
+            // curly braces in this file: Blade compiles them even in a JS comment.
+            // redirect_status=succeeded is the vocabulary ReservationPayment::state() reads so
+            // the pay-by-link page shows "processing" instead of re-offering payment while the
+            // webhook confirms.
             this.redirectToCompleted({
-                id: result.reservationId,
+                capture_id: result.captureId,
                 resrv_gateway: 'paypal',
                 redirect_status: 'succeeded',
             });
@@ -290,7 +293,7 @@ Alpine.data('paypalPayment', () => ({
                 redirect_status: 'processing',
             });
         } else {
-            let message = result.error || result.message || 'Payment capture failed';
+            let message = result.message || result.error || 'Payment capture failed';
 
             if (result.requiresNewOrder) {
                 // The failed capture consumed the PayPal order (and payment_id now references

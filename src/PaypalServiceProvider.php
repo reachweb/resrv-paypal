@@ -20,12 +20,16 @@ class PaypalServiceProvider extends AddonServiceProvider
 
         $this->mergeConfigFrom(__DIR__.'/../config/resrv-paypal.php', 'resrv-paypal');
 
-        $this->app->config->set('services.paypal', [
-            'client_id' => config('resrv-paypal.client_id'),
-            'client_secret' => config('resrv-paypal.client_secret'),
-            'mode' => config('resrv-paypal.mode'),
-            'webhook_id' => config('resrv-paypal.webhook_id'),
-        ]);
+        // A value a site sets under config/services.php 'paypal' wins; the add-on config (the
+        // PAYPAL_* env vars) fills in whatever it leaves unset. The other way round, the add-on's
+        // 'sandbox' mode default would silently override a 'live' set in services.php.
+        $services = $this->app->config->get('services.paypal', []);
+
+        foreach (['client_id', 'client_secret', 'mode', 'webhook_id'] as $key) {
+            $services[$key] = $services[$key] ?? config("resrv-paypal.{$key}");
+        }
+
+        $this->app->config->set('services.paypal', $services);
     }
 
     public function bootAddon(): void
