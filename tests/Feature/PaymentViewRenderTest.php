@@ -49,6 +49,16 @@ class PaymentViewRenderTest extends AddonTestCase
     }
 
     #[Test]
+    public function it_shows_a_zero_decimal_currency_without_decimals(): void
+    {
+        config(['resrv-config.currency_isoCode' => 'JPY', 'resrv-config.currency_symbol' => '¥']);
+
+        // The yen has no minor unit: a fixed two-decimal format would print "¥ 3,168.00".
+        Livewire::test(CheckoutSurfaceStub::class, ['amount' => 3168.0])
+            ->assertSeeHtml('¥ 3168</span>');
+    }
+
+    #[Test]
     public function it_renders_on_the_pay_by_link_surface(): void
     {
         Livewire::test(PayByLinkSurfaceStub::class)
