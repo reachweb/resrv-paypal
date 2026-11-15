@@ -2,6 +2,7 @@
 
 namespace Reach\ResrvPaymentPaypal;
 
+use Illuminate\Support\Facades\Log;
 use PaypalServerSdkLib\Authentication\ClientCredentialsAuthCredentialsBuilder;
 use PaypalServerSdkLib\Environment;
 use PaypalServerSdkLib\PaypalServerSdkClient;
@@ -48,12 +49,22 @@ class PaypalServiceProvider extends AddonServiceProvider
         ], 'resrv-paypal-views');
 
         $this->app->singleton(PaypalServerSdkClient::class, function () {
+            $clientId = config('services.paypal.client_id');
+            $clientSecret = config('services.paypal.client_secret');
+
+            // Resolved only when PayPal is called (PaypalApiTrait::client()). The SDK builder
+            // would otherwise TypeError on a null id, or send blank credentials to PayPal.
+            if (blank($clientId) || blank($clientSecret)) {
+                $message = 'PayPal credentials are not configured. Set PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET in your .env file, or client_id and client_secret under paypal in config/services.php.';
+
+                Log::error($message);
+
+                throw new \RuntimeException($message);
+            }
+
             return PaypalServerSdkClientBuilder::init()
                 ->clientCredentialsAuthCredentials(
-                    ClientCredentialsAuthCredentialsBuilder::init(
-                        config('services.paypal.client_id'),
-                        config('services.paypal.client_secret')
-                    )
+                    ClientCredentialsAuthCredentialsBuilder::init($clientId, $clientSecret)
                 )
                 ->environment(
                     config('services.paypal.mode') === 'live'
