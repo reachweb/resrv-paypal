@@ -23,6 +23,20 @@ PayPal payment gateway add-on for [Statamic Resrv](https://github.com/reachweb/s
 > Resrv 6.5 or later; there is no release for Resrv 5, so a Resrv 5 site has to stay on the last
 > compatible commit: `composer require reachweb/resrv-payment-paypal:dev-main#049bfa9`.
 
+## Upgrading from 1.0.1
+
+1.0.1 never requested 3-D Secure for card-field payments: it passed a Hosted Fields option that
+Card Fields ignore, so every card payment was captured without authenticating the cardholder.
+Card payments now request 3-D Secure (see [3-D Secure](#3-d-secure-card-payments)). What changes
+for a site:
+
+- **Published payment view:** if you ran `vendor:publish --tag=resrv-paypal-views`, re-publish it
+  (`php artisan vendor:publish --tag=resrv-paypal-views --force`) and re-apply your edits. The old
+  copy keeps paying cards without 3-D Secure.
+- **Failed authentications are refused:** a card whose cardholder fails or cannot complete the
+  bank's check is not charged; the customer sees an error and can retry or pay with PayPal.
+- **New optional setting:** `PAYPAL_SCA_METHOD` (default `SCA_WHEN_REQUIRED`).
+
 ## Upgrading from 1.0.0
 
 v1.0.0 could not take payments: the payment view failed to render, and a refund PayPal rejected
@@ -86,6 +100,37 @@ If you have configuration caching enabled, clear it after updating your `.env` f
 ```bash
 php artisan config:clear
 ```
+
+### 3-D Secure (card payments)
+
+Card-field payments request 3-D Secure (Strong Customer Authentication) from PayPal. Choose when
+the cardholder's bank is asked to authenticate them:
+
+```env
+PAYPAL_SCA_METHOD=SCA_WHEN_REQUIRED
+```
+
+- `SCA_WHEN_REQUIRED` (default): only when a regional mandate such as PSD2 requires it, for
+  example an EU merchant charging an EU-issued card. Other card payments go through without a
+  challenge, and the chargeback liability stays with you.
+- `SCA_ALWAYS`: every card payment the card and its bank support. More payments shift liability to
+  the card issuer, at the cost of a challenge step for more customers.
+
+The setting lives in `config/resrv-paypal.php` (`sca_method`). PayPal wallet payments are not
+affected: PayPal authenticates those itself.
+
+When PayPal reports the authentication result, the gateway follows
+[PayPal's recommended actions](https://developer.paypal.com/docs/checkout/advanced/customize/3d-secure/response-parameters/):
+the card is charged when liability shifted (`POSSIBLE`), when the card or its bank does not take
+part in 3-D Secure, or when no authentication was needed. It is **not** charged when the
+cardholder failed or could not complete authentication (`liability_shift` `NO` on an enrolled
+card) or when the authentication system was unavailable (`UNKNOWN`); the customer sees an error
+and can try again or pay with PayPal.
+
+To test in sandbox, use PayPal's
+[3-D Secure test cards](https://developer.paypal.com/docs/checkout/advanced/customize/3d-secure/test/).
+The US cards may not be challenged under `SCA_WHEN_REQUIRED` (no mandate applies to them), so set
+`PAYPAL_SCA_METHOD=SCA_ALWAYS` while testing, or use the cards for your own region.
 
 ## Webhook Configuration (Required)
 
@@ -200,6 +245,10 @@ This publishes the view to `resources/views/vendor/resrv-paypal/livewire/checkou
 
 When you customize it, keep the script's contract with the server:
 
+- The card fields' `createOrder` must get its order from `POST /resrv-paypal/order/{orderId}/card`
+  (with the current order id), which creates the card order that carries the 3-D Secure request.
+  Returning the order the page was mounted with pays cards without 3-D Secure. After a card
+  attempt, the PayPal button gets a wallet order back from `POST /resrv-paypal/order/{orderId}/paypal`.
 - After a successful capture, return the customer to `checkoutCompletedUrl` with the
   `capture_id` from the capture response (plus `resrv_gateway` and `redirect_status`). The
   checkout-complete page looks the reservation up by that capture id; it does not accept a

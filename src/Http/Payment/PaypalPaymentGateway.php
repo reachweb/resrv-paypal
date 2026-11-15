@@ -4,7 +4,12 @@ namespace Reach\ResrvPaymentPaypal\Http\Payment;
 
 use Illuminate\Support\Facades\Log;
 use PaypalServerSdkLib\Models\Builders\AmountWithBreakdownBuilder;
+use PaypalServerSdkLib\Models\Builders\CardAttributesBuilder;
+use PaypalServerSdkLib\Models\Builders\CardExperienceContextBuilder;
+use PaypalServerSdkLib\Models\Builders\CardRequestBuilder;
+use PaypalServerSdkLib\Models\Builders\CardVerificationBuilder;
 use PaypalServerSdkLib\Models\Builders\OrderRequestBuilder;
+use PaypalServerSdkLib\Models\Builders\PaymentSourceBuilder;
 use PaypalServerSdkLib\Models\Builders\PurchaseUnitRequestBuilder;
 use PaypalServerSdkLib\Models\Builders\RefundRequestBuilder;
 use PaypalServerSdkLib\Models\CheckoutPaymentIntent;
@@ -69,36 +74,62 @@ class PaypalPaymentGateway implements PaymentInterface
             'entry_title' => $reservation->entry()->title,
         ]);
 
-        $ordersController = $this->client->getOrdersController();
+        // The PayPal button pays this order. The card fields replace it with a card order on
+        // submit (createOrder() with a return URL, via PaypalCaptureController::replaceOrder()).
+        $orderId = $this->createOrder($reservation, $payment->format());
 
-        // Create order without payment source - JS SDK handles payment method selection
-        $orderRequest = OrderRequestBuilder::init(CheckoutPaymentIntent::CAPTURE, [
+        Log::info('PayPal: Order created successfully for JS SDK', [
+            'reservation_id' => $reservation->id,
+            'order_id' => $orderId,
+        ]);
+
+        $paymentIntent = new \stdClass;
+        $paymentIntent->id = $orderId;
+        // For JS SDK, we pass the order ID as client_secret (used by frontend)
+        $paymentIntent->client_secret = $orderId;
+
+        return $paymentIntent;
+    }
+
+    /**
+     * Create a PayPal order for the reservation and return its id. Without $cardReturnUrl the
+     * order has no payment source, which is what the PayPal button pays. With it the order is a
+     * card order: 3-D Secure is requested in the create-order body, the only place Card Fields
+     * read it (submit() takes no such option), with the configured verification method, and
+     * the return and cancel URLs PayPal asks for on every 3-D Secure request. A wallet order and
+     * a card order are never the same order: the card payment source has no business on an order
+     * the PayPal popup approves.
+     *
+     * @throws PaypalApiException
+     */
+    public function createOrder(Reservation $reservation, string $amount, ?string $cardReturnUrl = null): string
+    {
+        $order = OrderRequestBuilder::init(CheckoutPaymentIntent::CAPTURE, [
             PurchaseUnitRequestBuilder::init(
-                AmountWithBreakdownBuilder::init(
-                    config('resrv-config.currency_isoCode'),
-                    $payment->format()
-                )->build()
+                AmountWithBreakdownBuilder::init(config('resrv-config.currency_isoCode'), $amount)->build()
             )
                 ->referenceId((string) $reservation->id)
                 // custom_id rides onto the capture webhook (reference_id does not), so verifyPayment() can reconcile it.
                 ->customId((string) $reservation->id)
                 ->description($reservation->entry()->title)
                 ->build(),
-        ])->build();
-
-        $result = $this->paypalResult($ordersController->createOrder(['body' => $orderRequest]));
-
-        Log::info('PayPal: Order created successfully for JS SDK', [
-            'reservation_id' => $reservation->id,
-            'order_id' => $result->getId(),
         ]);
 
-        $paymentIntent = new \stdClass;
-        $paymentIntent->id = $result->getId();
-        // For JS SDK, we pass the order ID as client_secret (used by frontend)
-        $paymentIntent->client_secret = $result->getId();
+        if ($cardReturnUrl !== null) {
+            $order->paymentSource(PaymentSourceBuilder::init()->card(
+                CardRequestBuilder::init()
+                    ->attributes(CardAttributesBuilder::init()->verification(
+                        CardVerificationBuilder::init()->method(config('resrv-paypal.sca_method'))->build()
+                    )->build())
+                    ->experienceContext(CardExperienceContextBuilder::init()
+                        ->returnUrl($cardReturnUrl)
+                        ->cancelUrl($cardReturnUrl)
+                        ->build())
+                    ->build()
+            )->build());
+        }
 
-        return $paymentIntent;
+        return $this->paypalResult($this->client->getOrdersController()->createOrder(['body' => $order->build()]))->getId();
     }
 
     /**
@@ -146,10 +177,12 @@ class PaypalPaymentGateway implements PaymentInterface
         // with no way to mint a replacement order. VOIDED is dead. Every other order status
         // (CREATED/SAVED/APPROVED/PAYER_ACTION_REQUIRED) is un-captured, and only our capture
         // route can take money for it — so it is payable exactly while that route would capture
-        // it, and the same order id is handed back to the JS SDK to finish.
-        return $this->intentForResume($paymentId, match ($status) {
-            'COMPLETED' => $this->captureResumeStatus($this->orderCaptureStatus($result)),
-            'VOIDED' => 'canceled',
+        // it, and the same order id is handed back to the JS SDK to finish. An un-captured card
+        // order is the exception: the view mounts the stored order on the PayPal button, which
+        // must not pay a card order, and the card fields mint a fresh one on every submit anyway.
+        return $this->intentForResume($paymentId, match (true) {
+            $status === 'COMPLETED' => $this->captureResumeStatus($this->orderCaptureStatus($result)),
+            $status === 'VOIDED', $this->isCardOrder($result) => 'canceled',
             default => $this->orderCanStillBeCaptured($reservation) ? 'requires_payment_method' : 'canceled',
         });
     }
@@ -196,6 +229,14 @@ class PaypalPaymentGateway implements PaymentInterface
         $capture = $captures[0] ?? null;
 
         return is_array($capture) ? ($capture['status'] ?? null) : $capture?->getStatus();
+    }
+
+    /** Whether the order was created for, or approved through, the card fields. */
+    protected function isCardOrder($order): bool
+    {
+        $paymentSource = is_array($order) ? ($order['payment_source'] ?? null) : $order->getPaymentSource();
+
+        return is_array($paymentSource) ? isset($paymentSource['card']) : $paymentSource?->getCard() !== null;
     }
 
     /**

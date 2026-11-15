@@ -10,6 +10,7 @@ use Illuminate\Support\Facades\Log;
 use PaypalServerSdkLib\PaypalServerSdkClient;
 use Reach\ResrvPaymentPaypal\Http\Payment\PaypalApiException;
 use Reach\ResrvPaymentPaypal\Http\Payment\PaypalApiTrait;
+use Reach\ResrvPaymentPaypal\Http\Payment\PaypalPaymentGateway;
 use Reach\StatamicResrv\Enums\ReservationStatus;
 use Reach\StatamicResrv\Models\Reservation;
 
@@ -31,6 +32,63 @@ class PaypalCaptureController extends Controller
             'ip' => $request->ip(),
         ]);
 
+        return $this->withPayableReservation($request, $orderId, fn (Reservation $reservation) => $this->captureLocked($reservation, $orderId));
+    }
+
+    /**
+     * Replace the reservation's order with a fresh one for the funding source the customer is
+     * about to pay with: 'card' when the card fields submit (a card order carrying the 3-D Secure
+     * request), 'paypal' when the PayPal button opens after a card attempt replaced the wallet
+     * order. The new order becomes payment_id in the same locked write, so the order it replaces
+     * can no longer be captured. Authorised exactly like a capture of the current order.
+     */
+    public function replaceOrder(Request $request, string $orderId, string $source): JsonResponse
+    {
+        return $this->withPayableReservation($request, $orderId, function (Reservation $reservation) use ($request, $orderId, $source) {
+            try {
+                // Payment + surcharge: what both payment surfaces charge and what the webhook's
+                // amount guard expects.
+                $newOrderId = app(PaypalPaymentGateway::class)->createOrder(
+                    $reservation,
+                    $reservation->payment->add($reservation->payment_surcharge)->format(),
+                    // The page the customer pays on. Card Fields run 3-D Secure in PayPal's own
+                    // modal, so PayPal is not expected to send the customer here.
+                    $source === 'card' ? url()->previous() : null,
+                );
+            } catch (\Throwable $exception) {
+                Log::error('PayPal: Could not create a replacement order', [
+                    'order_id' => $orderId,
+                    'reservation_id' => $reservation->id,
+                    'source' => $source,
+                    'error' => $exception->getMessage(),
+                ]);
+
+                return response()->json([
+                    'error' => 'Order failed',
+                    'message' => 'PayPal could not start the payment. Please try again.',
+                ], 502);
+            }
+
+            $reservation->update(['payment_id' => $newOrderId]);
+
+            Log::info('PayPal: Order replaced for the chosen funding source', [
+                'reservation_id' => $reservation->id,
+                'replaced_order_id' => $orderId,
+                'order_id' => $newOrderId,
+                'source' => $source,
+                'ip' => $request->ip(),
+            ]);
+
+            return response()->json(['id' => $newOrderId]);
+        });
+    }
+
+    /**
+     * Run $then with the reservation that $orderId pays, re-read under its row lock, when this
+     * request may still pay that order; 403 otherwise.
+     */
+    protected function withPayableReservation(Request $request, string $orderId, \Closure $then): JsonResponse
+    {
         // Security: the order ID is an unguessable capability token bound to exactly one
         // reservation by findByPaymentId. It authorises capture in either legitimate context:
         //
@@ -50,7 +108,7 @@ class PaypalCaptureController extends Controller
         $reservation = Reservation::findByPaymentId($orderId)->first();
 
         if (! $reservation) {
-            Log::warning('PayPal: Capture attempted for unknown order', [
+            Log::warning('PayPal: Request for an unknown order', [
                 'order_id' => $orderId,
                 'ip' => $request->ip(),
             ]);
@@ -67,11 +125,11 @@ class PaypalCaptureController extends Controller
         // it and then sees the stored capture id as money already moving. Without the lock a
         // capture could land between Resrv verifying the "void" and its commit, unnoticed.
         // The SDK client's 15s timeout bounds how long the lock is held, as for refunds.
-        return DB::transaction(function () use ($request, $reservation, $orderId, $sessionOwnsReservation) {
+        return DB::transaction(function () use ($request, $reservation, $orderId, $sessionOwnsReservation, $then) {
             $fresh = Reservation::query()->lockForUpdate()->find($reservation->id);
 
             if (! $fresh || $fresh->payment_id !== $orderId || ! $this->mayCapture($fresh, $sessionOwnsReservation)) {
-                Log::warning('PayPal: Capture refused — order no longer payable for this request', [
+                Log::warning('PayPal: Request refused — order no longer payable for this request', [
                     'order_id' => $orderId,
                     'reservation_id' => $reservation->id,
                     'status' => $fresh?->status,
@@ -83,7 +141,7 @@ class PaypalCaptureController extends Controller
                 return response()->json(['error' => 'Invalid order'], 403);
             }
 
-            return $this->captureLocked($fresh, $orderId);
+            return $then($fresh);
         });
     }
 
@@ -103,6 +161,10 @@ class PaypalCaptureController extends Controller
 
     protected function captureLocked(Reservation $reservation, string $orderId): JsonResponse
     {
+        if ($refused = $this->refuseFailedCardAuthentication($reservation, $orderId)) {
+            return $refused;
+        }
+
         Log::info('PayPal: Capturing order via API', [
             'order_id' => $orderId,
             'reservation_id' => $reservation->id,
@@ -151,6 +213,54 @@ class PaypalCaptureController extends Controller
         }
 
         return $this->respondToOrder($reservation, $orderId, $order);
+    }
+
+    /**
+     * PayPal captures a card order whatever its 3-D Secure outcome; whether to go ahead is the
+     * merchant's call. Following PayPal's recommended actions, a card order is refused when the
+     * authentication system was unavailable (liability shift UNKNOWN) or when the card is enrolled
+     * but the cardholder was not authenticated (liability shift NO, enrollment Y). NO with any
+     * other enrollment status (not enrolled, unavailable at lookup, bypassed), a POSSIBLE shift,
+     * or no authentication at all (3-D Secure not required under SCA_WHEN_REQUIRED) proceeds with
+     * liability where PayPal leaves it. The JS SDK's liabilityShift cannot make this call: it lacks
+     * the enrollment status, and a browser can skip it by calling this route directly.
+     */
+    protected function refuseFailedCardAuthentication(Reservation $reservation, string $orderId): ?JsonResponse
+    {
+        try {
+            $order = $this->paypalResult($this->client->getOrdersController()->getOrder(['id' => $orderId]));
+        } catch (\Throwable $exception) {
+            Log::error('PayPal: Could not read the order before capture', [
+                'order_id' => $orderId,
+                'reservation_id' => $reservation->id,
+                'error' => $exception->getMessage(),
+            ]);
+
+            return $this->captureFailed();
+        }
+
+        $authentication = $order?->getPaymentSource()?->getCard()?->getAuthenticationResult();
+        $liabilityShift = $authentication?->getLiabilityShift();
+        $enrollmentStatus = $authentication?->getThreeDSecure()?->getEnrollmentStatus();
+
+        if ($liabilityShift !== 'UNKNOWN' && ! ($liabilityShift === 'NO' && $enrollmentStatus === 'Y')) {
+            return null;
+        }
+
+        Log::warning('PayPal: Card capture refused — 3-D Secure authentication did not succeed', [
+            'order_id' => $orderId,
+            'reservation_id' => $reservation->id,
+            'liability_shift' => $liabilityShift,
+            'enrollment_status' => $enrollmentStatus,
+            'authentication_status' => $authentication->getThreeDSecure()?->getAuthenticationStatus(),
+        ]);
+
+        // The order stays un-captured and payment_id still points at it, so a retry of this route
+        // is refused the same way; the card fields mint a fresh order on the next submit.
+        return response()->json([
+            'error' => 'Card authentication failed',
+            'message' => 'Your bank could not verify this card. Please try again or use a different payment method.',
+        ], 400);
     }
 
     protected function respondWithCapturedOrder(Reservation $reservation, string $orderId): JsonResponse

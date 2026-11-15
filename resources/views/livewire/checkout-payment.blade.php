@@ -92,6 +92,10 @@
 <script>
 Alpine.data('paypalPayment', () => ({
     orderId: $wire.clientSecret,
+    // What orderId was created for. The payment step mounts a wallet order (no payment source);
+    // the card fields replace it with a card order, which carries the 3-D Secure request, on
+    // every submit, and the PayPal button swaps a card order back for a wallet order.
+    orderSource: 'paypal',
     publicKey: $wire.publicKey,
     checkoutCompletedUrl: $wire.checkoutCompletedUrl,
     // Whether the mounting Livewire component can re-mint the payment intent in place —
@@ -155,7 +159,9 @@ Alpine.data('paypalPayment', () => ({
                 label: 'paypal'
             },
             createOrder: () => {
-                return this.orderId;
+                this.errors = false;
+
+                return this.orderSource === 'paypal' ? this.orderId : this.replaceOrder('paypal');
             },
             onApprove: async (data) => {
                 this.loading = true;
@@ -173,7 +179,7 @@ Alpine.data('paypalPayment', () => ({
             },
             onError: (err) => {
                 console.error('PayPal Button Error:', err);
-                this.errors = 'An error occurred with PayPal. Please try again.';
+                this.errors = this.errors || 'An error occurred with PayPal. Please try again.';
             }
         }).render('#paypal-button-container');
     },
@@ -196,10 +202,20 @@ Alpine.data('paypalPayment', () => ({
         };
 
         this.cardFields = paypal.CardFields({
-            createOrder: () => {
-                return this.orderId;
-            },
+            // Called on every submit. 3-D Secure is requested in the create-order body, so each
+            // attempt runs on a fresh card order (a failed authentication is never reused).
+            createOrder: () => this.replaceOrder('card'),
             onApprove: async (data) => {
+                // PayPal's 3-D Secure guidance: UNKNOWN means the authentication system was
+                // unavailable, so do not capture and ask the cardholder to retry. NO can still be
+                // capturable (a card not enrolled in 3-D Secure), so the capture route decides it
+                // from the order's authentication result, and refuses a failed authentication.
+                if (data.liabilityShift === 'UNKNOWN') {
+                    this.errors = 'Your bank could not verify this card right now. Please try again.';
+                    this.loading = false;
+                    return;
+                }
+
                 this.loading = true;
                 this.errors = false;
 
@@ -210,9 +226,14 @@ Alpine.data('paypalPayment', () => ({
                     this.loading = false;
                 }
             },
+            // The customer closed the 3-D Secure window: nothing was charged.
+            onCancel: () => {
+                this.errors = 'Card verification was cancelled. Please try again.';
+                this.loading = false;
+            },
             onError: (err) => {
                 console.error('CardFields Error:', err);
-                this.errors = 'Card payment error. Please check your details and try again.';
+                this.errors = this.errors || 'Card payment error. Please check your details and try again.';
                 this.loading = false;
             },
             style: cardFieldStyle
@@ -245,15 +266,38 @@ Alpine.data('paypalPayment', () => ({
         this.errors = false;
 
         try {
-            await this.cardFields.submit({
-                contingencies: ['SCA_ALWAYS']
-            });
-            // 3D Secure challenge will be shown if required, then onApprove callback handles the rest
+            // createOrder mints the card order (with the 3-D Secure request), PayPal shows the
+            // challenge if the issuer asks for one, then onApprove handles the result.
+            await this.cardFields.submit();
         } catch (error) {
             console.error('Card submit error:', error);
             this.errors = error.message || 'Failed to process card payment. Please try again.';
             this.loading = false;
         }
+    },
+
+    // Replace the reservation's order with a fresh one for this funding source ('card' or
+    // 'paypal'); the replaced order can no longer be captured. Returns the new order id.
+    async replaceOrder(source) {
+        const response = await fetch(`/resrv-paypal/order/${this.orderId}/${source}`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            }
+        });
+
+        const result = await response.json().catch(() => ({}));
+
+        if (!response.ok || !result.id) {
+            this.errors = result.message || 'Could not start the payment. Please refresh the page and try again.';
+            throw new Error(this.errors);
+        }
+
+        this.orderId = result.id;
+        this.orderSource = source;
+
+        return result.id;
     },
 
     async captureOrder(orderID) {
@@ -305,6 +349,7 @@ Alpine.data('paypalPayment', () => ({
                     // customer can retry in place.
                     await $wire.pay();
                     this.orderId = $wire.clientSecret || this.orderId;
+                    this.orderSource = 'paypal';
                 } else {
                     // Checkout: reload so the customer re-enters the payment step, which mints
                     // a fresh intent.

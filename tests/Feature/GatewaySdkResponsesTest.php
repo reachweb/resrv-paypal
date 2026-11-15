@@ -174,6 +174,21 @@ class GatewaySdkResponsesTest extends BootedAddonTestCase
     }
 
     #[Test]
+    public function a_stored_card_order_is_replaced_on_resume_instead_of_mounted_on_the_paypal_button(): void
+    {
+        // The view mounts the resumed order on the PayPal button, which must not pay a card order.
+        $this->orders->shouldReceive('getOrder')->andReturn($this->paypalSuccess(Order::class, [
+            'id' => 'ORDER-CARD',
+            'status' => 'APPROVED',
+            'payment_source' => ['card' => ['brand' => 'VISA', 'last_digits' => '5556']],
+        ]));
+
+        $intent = $this->gateway()->retrievePaymentIntent('ORDER-CARD', $this->reservation(['status' => 'awaiting_payment', 'payment_id' => 'ORDER-CARD']));
+
+        $this->assertSame('canceled', $intent->status);
+    }
+
+    #[Test]
     public function a_completed_order_is_judged_by_its_capture_not_the_order_status(): void
     {
         // Reached when the capture route never stored the capture id: an ACDC processor decline
