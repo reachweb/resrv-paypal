@@ -34,6 +34,7 @@ class PaymentViewRenderTest extends AddonTestCase
         $app['config']->set('app.key', 'base64:2fl+Ktvkfl+Fuz4Qp/A75G2RTiWVA/ZoKZvp6fiiM10=');
         $app['config']->set('services.paypal.mode', 'sandbox');
         $app['config']->set('resrv-config.currency_isoCode', 'EUR');
+        $app['config']->set('resrv-config.currency_symbol', '€');
     }
 
     #[Test]
@@ -43,6 +44,7 @@ class PaymentViewRenderTest extends AddonTestCase
             ->assertSeeHtml('id="paypal-button-container"')
             ->assertSeeHtml('id="card-number-field-container"')
             ->assertSeeHtml('currency=EUR')
+            ->assertSeeHtml('€ 316.80')
             ->assertSeeHtml('canRemintInline: false');
     }
 
@@ -61,7 +63,8 @@ class CheckoutSurfaceStub extends Component
 
     public string $publicKey = 'client-id';
 
-    public float $amount = 55.0;
+    // Both payment surfaces pass the amount as a float, which drops the trailing zero (316.8).
+    public float $amount = 316.80;
 
     public string $checkoutCompletedUrl = 'https://example.com/checkout-complete';
 
