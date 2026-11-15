@@ -92,10 +92,12 @@
 <script>
 Alpine.data('paypalPayment', () => ({
     orderId: $wire.clientSecret,
-    // What orderId was created for. The payment step mounts a wallet order (no payment source);
-    // the card fields replace it with a card order, which carries the 3-D Secure request, on
-    // every submit, and the PayPal button swaps a card order back for a wallet order.
-    orderSource: 'paypal',
+    // What orderId was created for: 'paypal' (a wallet order, no payment source), 'card' (a card
+    // order carrying the 3-D Secure request) or null (unknown). The card fields replace the order
+    // with a card order on every submit; the PayPal button pays a wallet order and swaps any other
+    // order for one. Checkout always mounts a fresh wallet order, but pay-by-link resumes the
+    // stored order, which can be a card order.
+    orderSource: @js(method_exists($this, 'pay') ? null : 'paypal'),
     publicKey: $wire.publicKey,
     checkoutCompletedUrl: $wire.checkoutCompletedUrl,
     // Whether the mounting Livewire component can re-mint the payment intent in place —
@@ -289,15 +291,31 @@ Alpine.data('paypalPayment', () => ({
 
         const result = await response.json().catch(() => ({}));
 
-        if (!response.ok || !result.id) {
-            this.errors = result.message || 'Could not start the payment. Please refresh the page and try again.';
-            throw new Error(this.errors);
+        if (response.ok && result.id) {
+            this.orderId = result.id;
+            this.orderSource = source;
+
+            return result.id;
         }
 
-        this.orderId = result.id;
-        this.orderSource = source;
+        if (result.captureId || result.requiresNewOrder) {
+            // The current order had already been captured (by an attempt whose response was
+            // lost), so the server kept that capture instead of starting a second payment: finish
+            // with it, exactly as after a capture.
+            try {
+                await this.finishPayment(response, result);
+            } catch (error) {
+                this.errors = error.message;
+                throw error;
+            }
 
-        return result.id;
+            // The page is on its way to the completed page; never hand the SDK an order.
+            this.loading = true;
+            return new Promise(() => {});
+        }
+
+        this.errors = result.message || 'Could not start the payment. Please refresh the page and try again.';
+        throw new Error(this.errors);
     },
 
     async captureOrder(orderID) {
@@ -309,8 +327,12 @@ Alpine.data('paypalPayment', () => ({
             }
         });
 
-        const result = await response.json();
+        await this.finishPayment(response, await response.json());
+    },
 
+    // Act on a capture result from the server: redirect for a completed or pending capture,
+    // otherwise throw with the message to show.
+    async finishPayment(response, result) {
         if (response.ok && result.status === 'COMPLETED') {
             // capture_id is what handleRedirectBack() resolves the reservation by (never the
             // guessable reservation id). resrv_gateway lets Resrv's resrv_checkout_redirect tag
@@ -349,7 +371,9 @@ Alpine.data('paypalPayment', () => ({
                     // customer can retry in place.
                     await $wire.pay();
                     this.orderId = $wire.clientSecret || this.orderId;
-                    this.orderSource = 'paypal';
+                    // pay() can resume the stored order rather than mint one, and that can be
+                    // a card order: let the PayPal button swap it for a wallet order.
+                    this.orderSource = null;
                 } else {
                     // Checkout: reload so the customer re-enters the payment step, which mints
                     // a fresh intent.

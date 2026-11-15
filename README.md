@@ -32,7 +32,8 @@ for a site:
 
 - **Published payment view:** if you ran `vendor:publish --tag=resrv-paypal-views`, re-publish it
   (`php artisan vendor:publish --tag=resrv-paypal-views --force`) and re-apply your edits. The old
-  copy keeps paying cards without 3-D Secure.
+  copy pays cards on an order that never requested 3-D Secure, so its card payments are now
+  refused; payments with the PayPal button keep working.
 - **Failed authentications are refused:** a card whose cardholder fails or cannot complete the
   bank's check is not charged; the customer sees an error and can retry or pay with PayPal.
 - **New optional setting:** `PAYPAL_SCA_METHOD` (default `SCA_WHEN_REQUIRED`).
@@ -124,8 +125,11 @@ When PayPal reports the authentication result, the gateway follows
 the card is charged when liability shifted (`POSSIBLE`), when the card or its bank does not take
 part in 3-D Secure, or when no authentication was needed. It is **not** charged when the
 cardholder failed or could not complete authentication (`liability_shift` `NO` on an enrolled
-card) or when the authentication system was unavailable (`UNKNOWN`); the customer sees an error
-and can try again or pay with PayPal.
+card), when the authentication system was unavailable (`UNKNOWN`), or when the card was paid on an
+order that never requested 3-D Secure (for example from an outdated published payment view); the
+customer sees an error and can try again or pay with PayPal.
+
+A blank or unrecognised `PAYPAL_SCA_METHOD` falls back to `SCA_WHEN_REQUIRED` and logs a warning.
 
 To test in sandbox, use PayPal's
 [3-D Secure test cards](https://developer.paypal.com/docs/checkout/advanced/customize/3d-secure/test/).
@@ -247,8 +251,12 @@ When you customize it, keep the script's contract with the server:
 
 - The card fields' `createOrder` must get its order from `POST /resrv-paypal/order/{orderId}/card`
   (with the current order id), which creates the card order that carries the 3-D Secure request.
-  Returning the order the page was mounted with pays cards without 3-D Secure. After a card
-  attempt, the PayPal button gets a wallet order back from `POST /resrv-paypal/order/{orderId}/paypal`.
+  A card paid on the order the page was mounted with is refused at capture. The PayPal button pays
+  the mounted order on checkout; after a card attempt, and on the pay-by-link page (which can
+  resume a card order), it gets a wallet order from `POST /resrv-paypal/order/{orderId}/paypal`.
+- Either order route can answer with a capture result (`status`, `captureId`) instead of a new
+  order `id`: the current order had already been captured by an attempt whose response was lost.
+  Finish exactly as after a capture, and do not hand the SDK an order.
 - After a successful capture, return the customer to `checkoutCompletedUrl` with the
   `capture_id` from the capture response (plus `resrv_gateway` and `redirect_status`). The
   checkout-complete page looks the reservation up by that capture id; it does not accept a

@@ -13,6 +13,8 @@ use PaypalServerSdkLib\Models\Builders\PaymentSourceBuilder;
 use PaypalServerSdkLib\Models\Builders\PurchaseUnitRequestBuilder;
 use PaypalServerSdkLib\Models\Builders\RefundRequestBuilder;
 use PaypalServerSdkLib\Models\CheckoutPaymentIntent;
+use PaypalServerSdkLib\Models\Order;
+use PaypalServerSdkLib\Models\OrdersCardVerificationMethod;
 use PaypalServerSdkLib\PaypalServerSdkClient;
 use Reach\StatamicResrv\Enums\ReservationStatus;
 use Reach\StatamicResrv\Events\ReservationConfirmed;
@@ -25,6 +27,9 @@ use Reach\StatamicResrv\Models\Reservation;
 class PaypalPaymentGateway implements PaymentInterface
 {
     use PaypalApiTrait;
+
+    /** reference_id prefix of an order createOrder() made for the card fields. */
+    private const CARD_ORDER_REFERENCE = 'card-';
 
     protected PaypalServerSdkClient $client;
 
@@ -98,7 +103,7 @@ class PaypalPaymentGateway implements PaymentInterface
      * read it (submit() takes no such option), with the configured verification method, and
      * the return and cancel URLs PayPal asks for on every 3-D Secure request. A wallet order and
      * a card order are never the same order: the card payment source has no business on an order
-     * the PayPal popup approves.
+     * the PayPal popup approves. A card order's reference_id marks it (see isCardOrder()).
      *
      * @throws PaypalApiException
      */
@@ -108,7 +113,7 @@ class PaypalPaymentGateway implements PaymentInterface
             PurchaseUnitRequestBuilder::init(
                 AmountWithBreakdownBuilder::init(config('resrv-config.currency_isoCode'), $amount)->build()
             )
-                ->referenceId((string) $reservation->id)
+                ->referenceId(($cardReturnUrl === null ? '' : self::CARD_ORDER_REFERENCE).$reservation->id)
                 // custom_id rides onto the capture webhook (reference_id does not), so verifyPayment() can reconcile it.
                 ->customId((string) $reservation->id)
                 ->description($reservation->entry()->title)
@@ -119,7 +124,7 @@ class PaypalPaymentGateway implements PaymentInterface
             $order->paymentSource(PaymentSourceBuilder::init()->card(
                 CardRequestBuilder::init()
                     ->attributes(CardAttributesBuilder::init()->verification(
-                        CardVerificationBuilder::init()->method(config('resrv-paypal.sca_method'))->build()
+                        CardVerificationBuilder::init()->method($this->scaMethod())->build()
                     )->build())
                     ->experienceContext(CardExperienceContextBuilder::init()
                         ->returnUrl($cardReturnUrl)
@@ -130,6 +135,28 @@ class PaypalPaymentGateway implements PaymentInterface
         }
 
         return $this->paypalResult($this->client->getOrdersController()->createOrder(['body' => $order->build()]))->getId();
+    }
+
+    /**
+     * The configured 3-D Secure method. A blank or unknown value falls back to SCA_WHEN_REQUIRED
+     * instead of reaching PayPal: an empty method breaks every card order, and AVS_CVV (which the
+     * Orders API also accepts) would switch 3-D Secure off.
+     */
+    protected function scaMethod(): string
+    {
+        $method = config('resrv-paypal.sca_method');
+
+        if (in_array($method, [OrdersCardVerificationMethod::SCA_ALWAYS, OrdersCardVerificationMethod::SCA_WHEN_REQUIRED], true)) {
+            return $method;
+        }
+
+        if (filled($method)) {
+            Log::warning('PayPal: PAYPAL_SCA_METHOD must be SCA_ALWAYS or SCA_WHEN_REQUIRED; using SCA_WHEN_REQUIRED', [
+                'sca_method' => $method,
+            ]);
+        }
+
+        return OrdersCardVerificationMethod::SCA_WHEN_REQUIRED;
     }
 
     /**
@@ -177,12 +204,14 @@ class PaypalPaymentGateway implements PaymentInterface
         // with no way to mint a replacement order. VOIDED is dead. Every other order status
         // (CREATED/SAVED/APPROVED/PAYER_ACTION_REQUIRED) is un-captured, and only our capture
         // route can take money for it — so it is payable exactly while that route would capture
-        // it, and the same order id is handed back to the JS SDK to finish. An un-captured card
-        // order is the exception: the view mounts the stored order on the PayPal button, which
-        // must not pay a card order, and the card fields mint a fresh one on every submit anyway.
-        return $this->intentForResume($paymentId, match (true) {
-            $status === 'COMPLETED' => $this->captureResumeStatus($this->orderCaptureStatus($result)),
-            $status === 'VOIDED', $this->isCardOrder($result) => 'canceled',
+        // it, and the same order id is handed back to the JS SDK to finish. That includes a card
+        // order: the pay-by-link view swaps a resumed order for a wallet order before the PayPal
+        // button pays it, and the card fields mint a fresh card order on every submit. Reporting
+        // it canceled instead would let a concurrent pay() write a new order over a capture
+        // landing on this one.
+        return $this->intentForResume($paymentId, match ($status) {
+            'COMPLETED' => $this->captureResumeStatus($this->orderCaptureStatus($result)),
+            'VOIDED' => 'canceled',
             default => $this->orderCanStillBeCaptured($reservation) ? 'requires_payment_method' : 'canceled',
         });
     }
@@ -231,12 +260,13 @@ class PaypalPaymentGateway implements PaymentInterface
         return is_array($capture) ? ($capture['status'] ?? null) : $capture?->getStatus();
     }
 
-    /** Whether the order was created for, or approved through, the card fields. */
-    protected function isCardOrder($order): bool
+    /**
+     * Whether createOrder() made this order for the card fields, so it carries the 3-D Secure
+     * request. PayPal echoes the reference_id createOrder() set; the browser cannot change it.
+     */
+    public static function isCardOrder(Order $order): bool
     {
-        $paymentSource = is_array($order) ? ($order['payment_source'] ?? null) : $order->getPaymentSource();
-
-        return is_array($paymentSource) ? isset($paymentSource['card']) : $paymentSource?->getCard() !== null;
+        return str_starts_with((string) ($order->getPurchaseUnits()[0] ?? null)?->getReferenceId(), self::CARD_ORDER_REFERENCE);
     }
 
     /**

@@ -174,18 +174,21 @@ class GatewaySdkResponsesTest extends BootedAddonTestCase
     }
 
     #[Test]
-    public function a_stored_card_order_is_replaced_on_resume_instead_of_mounted_on_the_paypal_button(): void
+    public function a_stored_card_order_resumes_like_any_uncaptured_order(): void
     {
-        // The view mounts the resumed order on the PayPal button, which must not pay a card order.
+        // Reporting it canceled would make a second pay-by-link tab mint a new order and write it
+        // over a capture landing on this one. The view swaps it for a wallet order instead.
         $this->orders->shouldReceive('getOrder')->andReturn($this->paypalSuccess(Order::class, [
             'id' => 'ORDER-CARD',
             'status' => 'APPROVED',
+            'purchase_units' => [['reference_id' => 'card-1']],
             'payment_source' => ['card' => ['brand' => 'VISA', 'last_digits' => '5556']],
         ]));
 
         $intent = $this->gateway()->retrievePaymentIntent('ORDER-CARD', $this->reservation(['status' => 'awaiting_payment', 'payment_id' => 'ORDER-CARD']));
 
-        $this->assertSame('canceled', $intent->status);
+        $this->assertSame('requires_payment_method', $intent->status);
+        $this->assertSame('ORDER-CARD', $intent->client_secret);
     }
 
     #[Test]

@@ -53,6 +53,29 @@ class PaymentViewRenderTest extends AddonTestCase
             ->assertSeeHtml('id="paypal-button-container"')
             ->assertSeeHtml('canRemintInline: true');
     }
+
+    #[Test]
+    public function the_card_fields_pay_on_a_card_order_that_requests_3ds(): void
+    {
+        $checkout = $this->script(CheckoutSurfaceStub::class);
+
+        // Handing the card fields the mounted wallet order is how card payments ran without
+        // 3-D Secure: the request rides only on the order the replace route creates.
+        $this->assertStringContainsString("createOrder: () => this.replaceOrder('card')", $checkout);
+        $this->assertStringContainsString('fetch(`/resrv-paypal/order/${this.orderId}/${source}`', $checkout);
+        $this->assertStringNotContainsString('contingencies', $checkout);
+
+        // Checkout mounts a fresh wallet order the PayPal button pays as is; pay-by-link may resume
+        // a card order, which the button must swap for a wallet order first.
+        $this->assertStringContainsString("orderSource: 'paypal',", $checkout);
+        $this->assertStringContainsString('orderSource: null,', $this->script(PayByLinkSurfaceStub::class));
+    }
+
+    /** The view's Alpine script, which Livewire ships in the component's effects. */
+    protected function script(string $component): string
+    {
+        return implode("\n", Livewire::test($component)->effects['scripts']);
+    }
 }
 
 class CheckoutSurfaceStub extends Component
