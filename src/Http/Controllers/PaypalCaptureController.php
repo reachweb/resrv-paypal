@@ -306,12 +306,14 @@ class PaypalCaptureController extends Controller
      * Refuse an un-captured order that must not be captured. PayPal captures a card order
      * whatever its 3-D Secure outcome; whether to go ahead is the merchant's call.
      *
-     *  - Only a CREATED or APPROVED order is captured. A card order reads CREATED once its
-     *    challenge finishes (the card fields never move it to APPROVED), a wallet order reads
-     *    APPROVED once the buyer approves it, and PayPal refuses a CREATED wallet order itself. A
-     *    card order still waiting on its challenge (PAYER_ACTION_REQUIRED) has no 3-D Secure
-     *    result yet, and must not be captured on the strength of a read taken before the
-     *    challenge failed.
+     *  - A card order is captured when it reads CREATED or APPROVED: it reads CREATED once its
+     *    challenge finishes (the card fields never move it to APPROVED). An order with no card is
+     *    captured only when APPROVED, as a wallet order reads once the buyer approves it. A
+     *    CREATED order with no card has not been approved at all, and this read is taken before
+     *    the lock: a card confirmed on it afterwards (a script handing the wallet order to the
+     *    card fields) would be captured without any of the checks below. A card order still
+     *    waiting on its challenge (PAYER_ACTION_REQUIRED) has no 3-D Secure result yet, and must
+     *    not be captured on the strength of a read taken before the challenge failed.
      *  - A card payment is captured only on a card order createOrder() made, which carries the
      *    configured 3-D Secure request. A card paid on the wallet order (an outdated published
      *    view, or a script that hands it to the card fields) never asked for 3-D Secure.
@@ -336,7 +338,9 @@ class PaypalCaptureController extends Controller
         $liabilityShift = $card?->getAuthenticationResult()?->getLiabilityShift();
         $threeDSecure = $card?->getAuthenticationResult()?->getThreeDSecure();
 
-        $payable = in_array($order->getStatus(), ['CREATED', 'APPROVED'], true);
+        $payable = $card === null
+            ? $order->getStatus() === 'APPROVED'
+            : in_array($order->getStatus(), ['CREATED', 'APPROVED'], true);
 
         $reason = match (true) {
             ! $payable => 'the order is not ready to capture',

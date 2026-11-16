@@ -412,6 +412,28 @@ class CaptureRouteTest extends BootedAddonTestCase
     }
 
     #[Test]
+    public function an_unapproved_order_without_a_card_is_not_captured(): void
+    {
+        // Nobody has approved the order the page was mounted with. The read is taken before the
+        // lock, so a card confirmed on it afterwards (a script handing the wallet order to the
+        // card fields) would reach PayPal without the 3-D Secure checks.
+        $reservation = $this->reservation(['status' => 'pending', 'payment_id' => 'ORDER-1']);
+        $this->orders->shouldReceive('getOrder')->andReturn($this->paypalSuccess(Order::class, [
+            'id' => 'ORDER-1',
+            'status' => 'CREATED',
+            'purchase_units' => [['reference_id' => (string) $reservation->id, 'amount' => ['currency_code' => 'EUR', 'value' => '55.00']]],
+        ]));
+        $this->orders->shouldNotReceive('captureOrder');
+
+        $this->withSession(['resrv_reservation' => $reservation->id])
+            ->postJson('/resrv-paypal/capture/ORDER-1')
+            ->assertStatus(400)
+            ->assertJson(['error' => 'Payment declined']);
+
+        $this->assertSame('ORDER-1', $reservation->fresh()->payment_id);
+    }
+
+    #[Test]
     public function an_order_that_cannot_be_read_before_capture_is_not_captured(): void
     {
         $reservation = $this->reservation(['status' => 'pending', 'payment_id' => 'ORDER-1']);

@@ -645,11 +645,12 @@ class PaypalPaymentGateway implements PaymentInterface
 
         // status is a plain string column in Resrv v6 (not an enum cast), so compare against ->value.
         if ($reservation->status === ReservationStatus::CONFIRMED->value) {
-            // Found through custom_id, so payment_id is not this capture: another payment already
-            // paid this booking, and this one charged the customer a second time. E.g. a capture
-            // that timed out at the capture route and completed after the customer paid a
-            // replacement order. A redelivery of the paying capture is found by payment_id.
-            if ($eventType === 'PAYMENT.CAPTURE.COMPLETED' && $foundByCustomId) {
+            // Another payment already paid this booking, so this capture charged the customer a
+            // second time: e.g. a capture that timed out at the capture route and completed after
+            // the customer paid a replacement order. A redelivery of the paying capture is found
+            // by payment_id, unless another delivery confirmed the booking with this capture id
+            // between that lookup and the custom_id one: then payment_id is this capture.
+            if ($eventType === 'PAYMENT.CAPTURE.COMPLETED' && $foundByCustomId && $reservation->payment_id !== $captureId) {
                 Log::warning('PayPal: Capture completed for a reservation another payment already confirmed — manual refund likely required.', [
                     'reservation_id' => $reservation->id,
                     'capture_id' => $captureId,
