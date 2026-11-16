@@ -39,9 +39,10 @@ class CaptureRouteTest extends BootedAddonTestCase
 
     /**
      * A card-funded order with the 3-D Secure result PayPal reports, or none. The reference_id is
-     * the one createOrder() gives a card order ('card-1'), or a wallet order's ('1').
+     * the one createOrder() gives a card order ('card-1'), or a wallet order's ('1'). A card order
+     * reads CREATED after the card fields approve it, not APPROVED (seen in the PayPal sandbox).
      */
-    protected function cardOrder(?string $liabilityShift = null, ?string $enrollmentStatus = null, ?string $authenticationStatus = null, string $referenceId = 'card-1', string $status = 'APPROVED')
+    protected function cardOrder(?string $liabilityShift = null, ?string $enrollmentStatus = null, ?string $authenticationStatus = null, string $referenceId = 'card-1', string $status = 'CREATED')
     {
         $card = ['brand' => 'VISA', 'last_digits' => '1368'];
 
@@ -278,8 +279,11 @@ class CaptureRouteTest extends BootedAddonTestCase
             '3-D Secure not performed' => [null],
             // Approved by the card fields on the wallet order, which carried no 3-D Secure request.
             'card on a wallet order' => [null, 'referenceId' => '1'],
+            'step-up succeeded, APPROVED' => ['POSSIBLE', 'Y', 'Y', 'status' => 'APPROVED'],
+            'step-up failed, APPROVED' => ['NO', 'Y', 'N', 'status' => 'APPROVED'],
             // Read before the challenge finished: no result to judge yet.
             'challenge not finished' => [null, 'status' => 'PAYER_ACTION_REQUIRED'],
+            'voided' => ['POSSIBLE', 'Y', 'Y', 'status' => 'VOIDED'],
         ];
 
         $order = null;
@@ -323,7 +327,10 @@ class CaptureRouteTest extends BootedAddonTestCase
             'bypassed' => 'captured',
             '3-D Secure not performed' => 'captured',
             'card on a wallet order' => $refused,
+            'step-up succeeded, APPROVED' => 'captured',
+            'step-up failed, APPROVED' => $refused,
             'challenge not finished' => '400 Payment declined',
+            'voided' => '400 Payment declined',
         ], $results);
     }
 

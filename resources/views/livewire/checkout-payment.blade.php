@@ -273,7 +273,9 @@ Alpine.data('paypalPayment', () => ({
             await this.cardFields.submit();
         } catch (error) {
             console.error('Card submit error:', error);
-            this.errors = error.message || 'Failed to process card payment. Please try again.';
+            // Keep a message replaceOrder() set from the server's answer. The SDK's own errors
+            // (e.g. "Error with obtaining 3DS contingency, {...}") are not for the customer.
+            this.errors = this.errors || 'Failed to process card payment. Please try again.';
             this.loading = false;
         }
     },
