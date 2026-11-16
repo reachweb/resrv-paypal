@@ -116,6 +116,8 @@ class PaypalCaptureController extends Controller
                 'replaced_order_id' => $orderId,
                 'order_id' => $newOrderId,
                 'source' => $source,
+                // What the card order asked PayPal for: PayPal does not return it on the order.
+                'sca_method' => $source === 'card' ? PaypalPaymentGateway::scaMethod() : null,
                 'ip' => $request->ip(),
             ]);
 
