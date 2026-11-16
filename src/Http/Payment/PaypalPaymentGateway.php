@@ -323,7 +323,9 @@ class PaypalPaymentGateway implements PaymentInterface
 
     public function getPublicKey(Reservation $reservation)
     {
-        return config('services.paypal.client_id');
+        // Resrv's Checkout stores this in a string property before it creates the order. A null
+        // (PAYPAL_CLIENT_ID unset) would TypeError there, before client() reports what's missing.
+        return (string) config('services.paypal.client_id');
     }
 
     public function getSecretKey(Reservation $reservation)
