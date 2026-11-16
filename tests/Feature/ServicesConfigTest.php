@@ -2,6 +2,8 @@
 
 namespace Reach\ResrvPaymentPaypal\Tests\Feature;
 
+use PaypalServerSdkLib\Environment;
+use PaypalServerSdkLib\PaypalServerSdkClient;
 use PHPUnit\Framework\Attributes\Test;
 use Reach\ResrvPaymentPaypal\Tests\BootedAddonTestCase;
 
@@ -34,5 +36,16 @@ class ServicesConfigTest extends BootedAddonTestCase
         $this->assertSame('live', config('services.paypal.mode'));
         // Left unset in services.php, so the add-on config (PAYPAL_WEBHOOK_ID) fills it in.
         $this->assertSame('test_webhook_id', config('services.paypal.webhook_id'));
+    }
+
+    #[Test]
+    public function the_sdk_client_is_built_from_them_for_live_with_a_timeout(): void
+    {
+        $client = app(PaypalServerSdkClient::class);
+
+        $this->assertSame('services-client-id', $client->getClientCredentialsAuth()->getOAuthClientId());
+        $this->assertSame(Environment::PRODUCTION, $client->getEnvironment());
+        // Capture and refund call PayPal under the reservation's row lock; the SDK default is no timeout.
+        $this->assertSame(15, $client->getTimeout());
     }
 }

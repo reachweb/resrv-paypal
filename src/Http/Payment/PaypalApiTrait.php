@@ -4,9 +4,19 @@ namespace Reach\ResrvPaymentPaypal\Http\Payment;
 
 use Illuminate\Support\Facades\Http;
 use PaypalServerSdkLib\Http\ApiResponse;
+use PaypalServerSdkLib\PaypalServerSdkClient;
 
 trait PaypalApiTrait
 {
+    /**
+     * The SDK client, resolved at the point of use rather than in a constructor. Without
+     * credentials the container binding throws a clear RuntimeException (PaypalServiceProvider).
+     */
+    protected function client(): PaypalServerSdkClient
+    {
+        return app(PaypalServerSdkClient::class);
+    }
+
     /**
      * The result of an SDK call, or a PaypalApiException when PayPal answered with an HTTP error.
      * Every SDK call goes through here: the SDK returns errors instead of throwing them, so a

@@ -27,13 +27,14 @@ PayPal payment gateway add-on for [Statamic Resrv](https://github.com/reachweb/s
 
 1.0.1 never requested 3-D Secure for card-field payments: it passed a Hosted Fields option that
 Card Fields ignore, so every card payment was captured without authenticating the cardholder.
-Card payments now request 3-D Secure (see [3-D Secure](#3-d-secure-card-payments)). What changes
-for a site:
+Card payments now request 3-D Secure (see [3-D Secure](#3-d-secure-card-payments)). 1.0.1 also
+dropped trailing zeros from the amount on the card pay button: €316.80 read "Pay € 316.8". What
+changes for a site:
 
 - **Published payment view:** if you ran `vendor:publish --tag=resrv-paypal-views`, re-publish it
   (`php artisan vendor:publish --tag=resrv-paypal-views --force`) and re-apply your edits. The old
   copy pays cards on an order that never requested 3-D Secure, so its card payments are now
-  refused; payments with the PayPal button keep working.
+  refused (payments with the PayPal button keep working), and it keeps showing "€ 316.8".
 - **Failed authentications are refused:** a card whose cardholder fails or cannot complete the
   bank's check is not charged; the customer sees an error and can retry or pay with PayPal.
 - **New optional setting:** `PAYPAL_SCA_METHOD` (default `SCA_WHEN_REQUIRED`).

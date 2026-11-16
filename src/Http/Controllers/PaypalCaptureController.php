@@ -8,7 +8,6 @@ use Illuminate\Routing\Controller;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use PaypalServerSdkLib\Models\Order;
-use PaypalServerSdkLib\PaypalServerSdkClient;
 use Reach\ResrvPaymentPaypal\Http\Payment\PaypalApiException;
 use Reach\ResrvPaymentPaypal\Http\Payment\PaypalApiTrait;
 use Reach\ResrvPaymentPaypal\Http\Payment\PaypalPaymentGateway;
@@ -18,13 +17,6 @@ use Reach\StatamicResrv\Models\Reservation;
 class PaypalCaptureController extends Controller
 {
     use PaypalApiTrait;
-
-    protected PaypalServerSdkClient $client;
-
-    public function __construct()
-    {
-        $this->client = app(PaypalServerSdkClient::class);
-    }
 
     public function capture(Request $request, string $orderId): JsonResponse
     {
@@ -42,7 +34,7 @@ class PaypalCaptureController extends Controller
         // Read before taking the row lock, which then covers only the capture call: whether the
         // order is approved and how its 3-D Secure went is PayPal's state, not the row's.
         try {
-            $order = $this->paypalResult($this->client->getOrdersController()->getOrder(['id' => $orderId]));
+            $order = $this->paypalResult($this->client()->getOrdersController()->getOrder(['id' => $orderId]));
         } catch (\Throwable $exception) {
             Log::error('PayPal: Could not read the order before capture', [
                 'order_id' => $orderId,
@@ -102,7 +94,7 @@ class PaypalCaptureController extends Controller
             // while it calls PayPal, so the order read here is settled: replacing a captured order
             // would let the customer pay twice.
             try {
-                $order = $this->paypalResult($this->client->getOrdersController()->getOrder(['id' => $orderId]));
+                $order = $this->paypalResult($this->client()->getOrdersController()->getOrder(['id' => $orderId]));
             } catch (\Throwable $exception) {
                 // A 404 as well: payment_id is then a stored capture id, not an order to replace.
                 return $this->replacementFailed($fresh, $orderId, $source, $exception);
@@ -264,7 +256,7 @@ class PaypalCaptureController extends Controller
             // PayPal documents the default Prefer: return=minimal response as id, status and links
             // only; the capture id and status live in purchase_units[].payments.captures, which
             // only the full representation is documented to carry.
-            $order = $this->paypalResult($this->client->getOrdersController()->captureOrder([
+            $order = $this->paypalResult($this->client()->getOrdersController()->captureOrder([
                 'id' => $orderId,
                 'prefer' => 'return=representation',
             ]));
@@ -377,7 +369,7 @@ class PaypalCaptureController extends Controller
     protected function respondWithCapturedOrder(Reservation $reservation, string $orderId): JsonResponse
     {
         try {
-            $order = $this->paypalResult($this->client->getOrdersController()->getOrder(['id' => $orderId]));
+            $order = $this->paypalResult($this->client()->getOrdersController()->getOrder(['id' => $orderId]));
         } catch (\Throwable $exception) {
             Log::error('PayPal: Could not read an already-captured order', [
                 'order_id' => $orderId,

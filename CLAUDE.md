@@ -62,6 +62,7 @@ Both routes are authorised by `mayPay()`: the order id must be the reservation's
 [PaypalServiceProvider.php](src/PaypalServiceProvider.php) registers:
 - `services.paypal` from `config/services.php` where set, falling back per key to `config/resrv-paypal.php` (the `PAYPAL_*` env vars)
 - Singleton `PaypalServerSdkClient` configured from `config/services.paypal`, with a 15s HTTP timeout (refund, capture, and the order replacement's read of the order it replaces run inside a DB row lock; the SDK default is no timeout)
+- The gateway and capture controller resolve the client at the point of use through `PaypalApiTrait::client()`, never in a constructor: Resrv builds every registered gateway to list them at checkout, so PayPal without credentials must still construct. Resolving the client without a client id or secret logs and throws a `RuntimeException` ("PayPal credentials are not configured")
 - Views under the `resrv-paypal` namespace; the gateway points Resrv at them via `paymentView()`
 
 ### Payment Flow (JS SDK)

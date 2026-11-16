@@ -15,7 +15,6 @@ use PaypalServerSdkLib\Models\Builders\RefundRequestBuilder;
 use PaypalServerSdkLib\Models\CheckoutPaymentIntent;
 use PaypalServerSdkLib\Models\Order;
 use PaypalServerSdkLib\Models\OrdersCardVerificationMethod;
-use PaypalServerSdkLib\PaypalServerSdkClient;
 use Reach\StatamicResrv\Enums\ReservationStatus;
 use Reach\StatamicResrv\Events\ReservationConfirmed;
 use Reach\StatamicResrv\Exceptions\RefundFailedException;
@@ -30,8 +29,6 @@ class PaypalPaymentGateway implements PaymentInterface
 
     /** reference_id prefix of an order createOrder() made for the card fields. */
     private const CARD_ORDER_REFERENCE = 'card-';
-
-    protected PaypalServerSdkClient $client;
 
     protected WebhookSignatureVerifier $webhookVerifier;
 
@@ -62,7 +59,9 @@ class PaypalPaymentGateway implements PaymentInterface
 
     public function __construct(?WebhookSignatureVerifier $webhookVerifier = null)
     {
-        $this->client = app(PaypalServerSdkClient::class);
+        // The SDK client is resolved on first PayPal call (PaypalApiTrait::client()), never here:
+        // Resrv builds every registered gateway to list them at checkout, so a PayPal without
+        // credentials must still construct and only fail when someone actually pays with it.
         $this->webhookVerifier = $webhookVerifier ?? app(WebhookSignatureVerifier::class);
     }
 
@@ -134,7 +133,7 @@ class PaypalPaymentGateway implements PaymentInterface
             )->build());
         }
 
-        return $this->paypalResult($this->client->getOrdersController()->createOrder(['body' => $order->build()]))->getId();
+        return $this->paypalResult($this->client()->getOrdersController()->createOrder(['body' => $order->build()]))->getId();
     }
 
     /**
@@ -175,7 +174,7 @@ class PaypalPaymentGateway implements PaymentInterface
     public function retrievePaymentIntent(string $paymentId, Reservation $reservation): ?object
     {
         try {
-            $result = $this->paypalResult($this->client->getOrdersController()->getOrder(['id' => $paymentId]));
+            $result = $this->paypalResult($this->client()->getOrdersController()->getOrder(['id' => $paymentId]));
         } catch (PaypalApiException $exception) {
             // A 404 means $paymentId is not an order id (or the order expired). PayPal's payment_id
             // flips from the order id to the capture id the moment PaypalCaptureController
@@ -295,7 +294,7 @@ class PaypalPaymentGateway implements PaymentInterface
     protected function capturedPaymentAsIntent(string $paymentId): ?object
     {
         try {
-            $result = $this->paypalResult($this->client->getPaymentsController()->getCapturedPayment(['captureId' => $paymentId]));
+            $result = $this->paypalResult($this->client()->getPaymentsController()->getCapturedPayment(['captureId' => $paymentId]));
         } catch (PaypalApiException $exception) {
             if ($exception->statusCode === 404) {
                 return null;
@@ -335,8 +334,7 @@ class PaypalPaymentGateway implements PaymentInterface
     {
         // This runs inside the REFUNDED transition's database transaction (a row lock is
         // held), so keep it down to the single provider call.
-        $paymentsController = $this->client->getPaymentsController();
-
+        //
         // An empty refund body refunds the full remaining capture — payment + surcharge,
         // exactly what was charged and what the customer-cancellation email promises. A
         // partial refund of only `payment` would strand the surcharge at PayPal.
@@ -349,7 +347,9 @@ class PaypalPaymentGateway implements PaymentInterface
         // caps PayPal-Request-Id at 38 single-byte characters — concatenating the raw ids
         // overruns it once the reservation id reaches eight digits.
         try {
-            $refund = $this->paypalResult($paymentsController->refundCapturedPayment([
+            // The client is resolved in here so missing credentials also surface as
+            // RefundFailedException, like every other reason the refund cannot run.
+            $refund = $this->paypalResult($this->client()->getPaymentsController()->refundCapturedPayment([
                 'captureId' => $reservation->payment_id,
                 'paypalRequestId' => $this->refundRequestId($reservation),
                 'body' => RefundRequestBuilder::init()->build(),
@@ -394,7 +394,9 @@ class PaypalPaymentGateway implements PaymentInterface
 
     public function getPublicKey(Reservation $reservation)
     {
-        return config('services.paypal.client_id');
+        // Resrv's Checkout stores this in a string property before it creates the order. A null
+        // (PAYPAL_CLIENT_ID unset) would TypeError there, before client() reports what's missing.
+        return (string) config('services.paypal.client_id');
     }
 
     public function getSecretKey(Reservation $reservation)
@@ -489,7 +491,7 @@ class PaypalPaymentGateway implements PaymentInterface
         }
 
         try {
-            $result = $this->paypalResult($this->client->getPaymentsController()->getCapturedPayment([
+            $result = $this->paypalResult($this->client()->getPaymentsController()->getCapturedPayment([
                 'captureId' => $reservation->payment_id,
             ]));
 
