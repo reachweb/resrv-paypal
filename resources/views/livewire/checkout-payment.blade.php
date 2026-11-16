@@ -283,6 +283,10 @@ Alpine.data('paypalPayment', () => ({
     // Replace the reservation's order with a fresh one for this funding source ('card' or
     // 'paypal'); the replaced order can no longer be captured. Returns the new order id.
     async replaceOrder(source) {
+        // Until the server answers, the page's order may already have been replaced (a response
+        // lost after the swap committed), so the PayPal button must not hand it to the SDK as is.
+        this.orderSource = null;
+
         const response = await fetch(`/resrv-paypal/order/${this.orderId}/${source}`, {
             method: 'POST',
             headers: {
@@ -314,6 +318,17 @@ Alpine.data('paypalPayment', () => ({
             // The page is on its way to the completed page; never hand the SDK an order.
             this.loading = true;
             return new Promise(() => {});
+        }
+
+        if (response.status === 403 && this.canRemintInline) {
+            // The page's order is no longer the reservation's, e.g. a replacement whose response
+            // was lost. Pay-by-link picks up the reservation's current order in place (or shows
+            // that a payment is processing). Checkout cannot, so it keeps the message below and
+            // does not reload by itself: a 403 can also mean a capture was stored whose response
+            // was lost, and Resrv's checkout clears a pending reservation's payment on load.
+            await this.remintInline();
+            this.errors = 'Could not start the payment. Please try again.';
+            throw new Error(this.errors);
         }
 
         this.errors = result.message || 'Could not start the payment. Please refresh the page and try again.';
@@ -368,14 +383,9 @@ Alpine.data('paypalPayment', () => ({
                 // the dead capture), so the next attempt must run on a fresh order — retrying
                 // with the stale orderId would be rejected by the capture endpoint.
                 if (this.canRemintInline) {
-                    // Pay-by-link: pay() re-runs ReservationPayment's locked create-or-resume;
-                    // the dead capture reads as canceled, so a fresh order replaces it and the
-                    // customer can retry in place.
-                    await $wire.pay();
-                    this.orderId = $wire.clientSecret || this.orderId;
-                    // pay() can resume the stored order rather than mint one, and that can be
-                    // a card order: let the PayPal button swap it for a wallet order.
-                    this.orderSource = null;
+                    // Pay-by-link: the dead capture reads as canceled, so a fresh order replaces
+                    // it and the customer can retry in place.
+                    await this.remintInline();
                 } else {
                     // Checkout: reload so the customer re-enters the payment step, which mints
                     // a fresh intent.
@@ -386,6 +396,16 @@ Alpine.data('paypalPayment', () => ({
 
             throw new Error(message);
         }
+    },
+
+    // Pay-by-link only: pay() re-runs ReservationPayment's locked create-or-resume and hands back
+    // the reservation's current order, or shows that a payment is already processing.
+    async remintInline() {
+        await $wire.pay();
+        this.orderId = $wire.clientSecret || this.orderId;
+        // pay() can resume the stored order rather than mint one, and that can be a card order:
+        // let the PayPal button swap it for a wallet order.
+        this.orderSource = null;
     },
 
     redirectToCompleted(params) {

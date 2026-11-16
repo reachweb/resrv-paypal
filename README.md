@@ -259,6 +259,10 @@ When you customize it, keep the script's contract with the server:
 - Either order route can answer with a capture result (`status`, `captureId`) instead of a new
   order `id`: the current order had already been captured by an attempt whose response was lost.
   Finish exactly as after a capture, and do not hand the SDK an order.
+- A 403 from an order route means the page's order id is no longer the reservation's (for example
+  a replacement that went through but whose response was lost). Do not retry with that id, or hand
+  it to the PayPal button, until you know the current one: on the pay-by-link page call
+  `$wire.pay()` and use the new `$wire.clientSecret`; on checkout ask the customer to reload.
 - After a successful capture, return the customer to `checkoutCompletedUrl` with the
   `capture_id` from the capture response (plus `resrv_gateway` and `redirect_status`). The
   checkout-complete page looks the reservation up by that capture id; it does not accept a

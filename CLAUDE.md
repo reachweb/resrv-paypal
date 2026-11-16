@@ -55,6 +55,7 @@ Both routes are authorised by `mayPay()`: the order id must be the reservation's
 - PayPal button (wallet payments)
 - Card Fields (direct card input via ACDC)
 - Uses Alpine.js for state management
+- `orderSource` says whether the page's order is a wallet order the PayPal button may pay as is; `replaceOrder()` clears it before calling the server, because a replacement whose response is lost leaves the page holding an order that is no longer `payment_id`. A 403 from the replace route on pay-by-link re-runs `$wire.pay()` to pick up the reservation's current order (`remintInline()`, shared with the `requiresNewOrder` re-mint); checkout only asks for a reload, since a 403 there can also mean a stored capture whose response was lost, which Resrv's checkout clears on load
 - Blade compiles every `{{ }}` in the file, including inside JS comments — never write a non-PHP name (such as an Antlers tag) in double braces there. `tests/Feature/PaymentViewRenderTest.php` renders the view inside Livewire to catch this
 
 ### PayPal SDK Client
