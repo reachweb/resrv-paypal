@@ -26,10 +26,11 @@ PayPal payment gateway add-on for [Statamic Resrv](https://github.com/reachweb/s
 ## Upgrading from 1.0.1
 
 1.0.1 never requested 3-D Secure for card-field payments: it passed a Hosted Fields option that
-Card Fields ignore, so every card payment was captured without authenticating the cardholder.
-Card payments now request 3-D Secure (see [3-D Secure](#3-d-secure-card-payments)). 1.0.1 also
-dropped trailing zeros from the amount on the card pay button: €316.80 read "Pay € 316.8". What
-changes for a site:
+Card Fields ignore, so a card payment got at most PayPal's default (authentication only where a
+mandate such as PSD2 requires it), and it was captured without checking the authentication
+result. Card payments now request 3-D Secure (see [3-D Secure](#3-d-secure-card-payments)). 1.0.1
+also dropped trailing zeros from the amount on the card pay button: €316.80 read "Pay € 316.8".
+Upgrade with `composer update reachweb/resrv-payment-paypal`. What changes for a site:
 
 - **Published payment view:** if you ran `vendor:publish --tag=resrv-paypal-views`, re-publish it
   (`php artisan vendor:publish --tag=resrv-paypal-views --force`) and re-apply your edits. The old
