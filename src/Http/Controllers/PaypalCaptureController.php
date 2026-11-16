@@ -8,6 +8,7 @@ use Illuminate\Routing\Controller;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use PaypalServerSdkLib\Models\Order;
+use PaypalServerSdkLib\Models\OrdersCardVerificationMethod;
 use Reach\ResrvPaymentPaypal\Http\Payment\PaypalApiException;
 use Reach\ResrvPaymentPaypal\Http\Payment\PaypalApiTrait;
 use Reach\ResrvPaymentPaypal\Http\Payment\PaypalPaymentGateway;
@@ -318,6 +319,9 @@ class PaypalCaptureController extends Controller
      *    status (not enrolled, unavailable at lookup, bypassed), a POSSIBLE shift, or no
      *    authentication at all (3-D Secure not required under SCA_WHEN_REQUIRED) proceeds with
      *    liability where PayPal leaves it.
+     *  - Under SCA_ALWAYS a card order with no authentication result is refused: the merchant
+     *    asked for 3-D Secure on every card payment, and nothing shows it ran. The order's
+     *    reference_id only shows it was created with the request; the browser confirms the card.
      *
      * The JS SDK's liabilityShift cannot make these calls: it lacks the enrollment status, and a
      * browser can skip it by calling the capture route directly. A refused order stays
@@ -339,6 +343,7 @@ class PaypalCaptureController extends Controller
             ! PaypalPaymentGateway::isCardOrder($order) => 'a card paid an order that requested no 3-D Secure',
             $liabilityShift === 'UNKNOWN',
             $liabilityShift === 'NO' && $threeDSecure?->getEnrollmentStatus() === 'Y' => '3-D Secure authentication did not succeed',
+            $liabilityShift === null && PaypalPaymentGateway::scaMethod() === OrdersCardVerificationMethod::SCA_ALWAYS => '3-D Secure was required but not performed',
             default => null,
         };
 

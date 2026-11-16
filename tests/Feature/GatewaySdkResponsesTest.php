@@ -3,7 +3,9 @@
 namespace Reach\ResrvPaymentPaypal\Tests\Feature;
 
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Mail;
 use Mockery;
 use PaypalServerSdkLib\Controllers\OrdersController;
 use PaypalServerSdkLib\Controllers\PaymentsController;
@@ -17,6 +19,7 @@ use Reach\ResrvPaymentPaypal\Http\Payment\WebhookSignatureVerifier;
 use Reach\ResrvPaymentPaypal\Tests\BootedAddonTestCase;
 use Reach\StatamicResrv\Events\ReservationConfirmed;
 use Reach\StatamicResrv\Exceptions\RefundFailedException;
+use Reach\StatamicResrv\Mail\OrphanedPaymentNotification;
 use Reach\StatamicResrv\Support\ReservationRefundProcessor;
 
 /**
@@ -180,7 +183,8 @@ class GatewaySdkResponsesTest extends BootedAddonTestCase
         // over a capture landing on this one. The view swaps it for a wallet order instead.
         $this->orders->shouldReceive('getOrder')->andReturn($this->paypalSuccess(Order::class, [
             'id' => 'ORDER-CARD',
-            'status' => 'APPROVED',
+            // A card order reads CREATED after 3-D Secure, never APPROVED.
+            'status' => 'CREATED',
             'purchase_units' => [['reference_id' => 'card-1']],
             'payment_source' => ['card' => ['brand' => 'VISA', 'last_digits' => '5556']],
         ]));
@@ -273,5 +277,48 @@ class GatewaySdkResponsesTest extends BootedAddonTestCase
         $this->assertSame('confirmed', $reservation->fresh()->status);
         $this->assertSame('CAPTURE-1', $reservation->fresh()->payment_id);
         Event::assertDispatchedTimes(ReservationConfirmed::class, 1);
+    }
+
+    #[Test]
+    public function a_second_capture_for_a_confirmed_reservation_alerts_the_admins(): void
+    {
+        // A capture that completed at PayPal after its capture call timed out, while the customer
+        // paid a replacement order: the booking is already paid, so this one charged them twice.
+        Mail::fake();
+        Event::fake([ReservationConfirmed::class]);
+        Config::set('resrv-config.admin_email', 'admin@example.com');
+        $verifier = Mockery::mock(WebhookSignatureVerifier::class);
+        $verifier->shouldReceive('verify')->andReturn(true);
+        $gateway = new PaypalPaymentGateway($verifier);
+
+        $cases = [
+            // The capture of another order than the one that paid.
+            'second capture' => ['CAPTURE-1', 'CAPTURE-2'],
+            // A redelivery of the capture that paid.
+            'redelivered' => ['CAPTURE-3', 'CAPTURE-3'],
+        ];
+
+        $alerts = [];
+        foreach ($cases as $label => [$paymentId, $captureId]) {
+            $reservation = $this->reservation(['status' => 'confirmed', 'payment_id' => $paymentId]);
+
+            $gateway->verifyPayment(Request::create('/', 'POST', [], [], [], ['CONTENT_TYPE' => 'application/json'], json_encode([
+                'id' => 'WH-'.$captureId,
+                'event_type' => 'PAYMENT.CAPTURE.COMPLETED',
+                'resource' => [
+                    'id' => $captureId,
+                    'status' => 'COMPLETED',
+                    'custom_id' => (string) $reservation->id,
+                    'amount' => ['currency_code' => 'EUR', 'value' => '55.00'],
+                ],
+            ])));
+
+            $alerts[$label] = Mail::sent(OrphanedPaymentNotification::class, fn ($mail) => $mail->paymentIntentId === $captureId)->count();
+            $this->assertSame(['confirmed', $paymentId], [$reservation->fresh()->status, $reservation->fresh()->payment_id], $label);
+            $reservation->delete();
+        }
+
+        $this->assertSame(['second capture' => 1, 'redelivered' => 0], $alerts);
+        Event::assertNotDispatched(ReservationConfirmed::class);
     }
 }

@@ -123,7 +123,7 @@ class PaypalPaymentGateway implements PaymentInterface
             $order->paymentSource(PaymentSourceBuilder::init()->card(
                 CardRequestBuilder::init()
                     ->attributes(CardAttributesBuilder::init()->verification(
-                        CardVerificationBuilder::init()->method($this->scaMethod())->build()
+                        CardVerificationBuilder::init()->method(static::scaMethod())->build()
                     )->build())
                     ->experienceContext(CardExperienceContextBuilder::init()
                         ->returnUrl($cardReturnUrl)
@@ -141,7 +141,7 @@ class PaypalPaymentGateway implements PaymentInterface
      * instead of reaching PayPal: an empty method breaks every card order, and AVS_CVV (which the
      * Orders API also accepts) would switch 3-D Secure off.
      */
-    protected function scaMethod(): string
+    public static function scaMethod(): string
     {
         $method = config('resrv-paypal.sca_method');
 
@@ -645,6 +645,22 @@ class PaypalPaymentGateway implements PaymentInterface
 
         // status is a plain string column in Resrv v6 (not an enum cast), so compare against ->value.
         if ($reservation->status === ReservationStatus::CONFIRMED->value) {
+            // Found through custom_id, so payment_id is not this capture: another payment already
+            // paid this booking, and this one charged the customer a second time. E.g. a capture
+            // that timed out at the capture route and completed after the customer paid a
+            // replacement order. A redelivery of the paying capture is found by payment_id.
+            if ($eventType === 'PAYMENT.CAPTURE.COMPLETED' && $foundByCustomId) {
+                Log::warning('PayPal: Capture completed for a reservation another payment already confirmed — manual refund likely required.', [
+                    'reservation_id' => $reservation->id,
+                    'capture_id' => $captureId,
+                    'current_payment_id' => $reservation->payment_id,
+                ]);
+
+                OrphanedPaymentNotification::dispatchFor($reservation, $captureId, $eventId);
+
+                return response()->json([], 200);
+            }
+
             Log::info('PayPal: Webhook skipped - reservation already confirmed', [
                 'reservation_id' => $reservation->id,
                 'capture_id' => $captureId,

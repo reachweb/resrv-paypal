@@ -26,7 +26,8 @@ return [
     | The verification method PayPal applies to card-field payments:
     | 'SCA_WHEN_REQUIRED' authenticates the cardholder when a regional mandate
     | such as PSD2 requires it, 'SCA_ALWAYS' authenticates every card payment
-    | the card and issuer support. PayPal wallet payments are not affected.
+    | the card and issuer support, and refuses a card payment that reports no
+    | 3-D Secure result. PayPal wallet payments are not affected.
     |
     */
 

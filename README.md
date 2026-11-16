@@ -116,7 +116,8 @@ PAYPAL_SCA_METHOD=SCA_WHEN_REQUIRED
   example an EU merchant charging an EU-issued card. Other card payments go through without a
   challenge, and the chargeback liability stays with you.
 - `SCA_ALWAYS`: every card payment the card and its bank support. More payments shift liability to
-  the card issuer, at the cost of a challenge step for more customers.
+  the card issuer, at the cost of a challenge step for more customers. A card payment that PayPal
+  reports with no authentication result at all is refused under this setting.
 
 The setting lives in `config/resrv-paypal.php` (`sca_method`). PayPal wallet payments are not
 affected: PayPal authenticates those itself.
