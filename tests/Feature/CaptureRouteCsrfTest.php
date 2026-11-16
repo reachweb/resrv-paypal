@@ -27,26 +27,29 @@ class CaptureRouteCsrfTest extends TestCase
     // Laravel skips the CSRF check while running unit tests, so posting to the route can't catch a
     // missing exclusion. Resolve its middleware stack the way the router does instead.
     #[Test]
-    public function capture_route_is_excluded_from_csrf_protection(): void
+    public function capture_and_order_routes_are_excluded_from_csrf_protection(): void
     {
         // The HTTP kernel hands its middleware groups to the router when resolved, as it is on every request.
         $this->app->make(Kernel::class);
 
         $router = app('router');
-        $route = $router->getRoutes()->getByName('resrv-paypal.capture');
 
-        $this->assertNotNull($route, 'Route [resrv-paypal.capture] is not registered.');
+        foreach (['resrv-paypal.capture', 'resrv-paypal.order'] as $name) {
+            $route = $router->getRoutes()->getByName($name);
 
-        // Without its exclusions the route must run CSRF middleware, otherwise the check below proves nothing.
-        $this->assertNotEmpty(
-            array_intersect(self::CSRF_MIDDLEWARE, $router->resolveMiddleware($route->gatherMiddleware())),
-            'Route [resrv-paypal.capture] is not in a group that runs CSRF middleware.'
-        );
+            $this->assertNotNull($route, "Route [{$name}] is not registered.");
 
-        $this->assertSame(
-            [],
-            array_values(array_intersect(self::CSRF_MIDDLEWARE, $router->gatherRouteMiddleware($route))),
-            'Route [resrv-paypal.capture] still runs CSRF middleware.'
-        );
+            // Without its exclusions the route must run CSRF middleware, otherwise the check below proves nothing.
+            $this->assertNotEmpty(
+                array_intersect(self::CSRF_MIDDLEWARE, $router->resolveMiddleware($route->gatherMiddleware())),
+                "Route [{$name}] is not in a group that runs CSRF middleware."
+            );
+
+            $this->assertSame(
+                [],
+                array_values(array_intersect(self::CSRF_MIDDLEWARE, $router->gatherRouteMiddleware($route))),
+                "Route [{$name}] still runs CSRF middleware."
+            );
+        }
     }
 }

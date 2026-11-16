@@ -3,7 +3,9 @@
 namespace Reach\ResrvPaymentPaypal\Tests\Feature;
 
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Mail;
 use Mockery;
 use PaypalServerSdkLib\Controllers\OrdersController;
 use PaypalServerSdkLib\Controllers\PaymentsController;
@@ -17,6 +19,8 @@ use Reach\ResrvPaymentPaypal\Http\Payment\WebhookSignatureVerifier;
 use Reach\ResrvPaymentPaypal\Tests\BootedAddonTestCase;
 use Reach\StatamicResrv\Events\ReservationConfirmed;
 use Reach\StatamicResrv\Exceptions\RefundFailedException;
+use Reach\StatamicResrv\Mail\OrphanedPaymentNotification;
+use Reach\StatamicResrv\Models\Reservation;
 use Reach\StatamicResrv\Support\ReservationRefundProcessor;
 
 /**
@@ -174,6 +178,25 @@ class GatewaySdkResponsesTest extends BootedAddonTestCase
     }
 
     #[Test]
+    public function a_stored_card_order_resumes_like_any_uncaptured_order(): void
+    {
+        // Reporting it canceled would make a second pay-by-link tab mint a new order and write it
+        // over a capture landing on this one. The view swaps it for a wallet order instead.
+        $this->orders->shouldReceive('getOrder')->andReturn($this->paypalSuccess(Order::class, [
+            'id' => 'ORDER-CARD',
+            // A card order reads CREATED after 3-D Secure, never APPROVED.
+            'status' => 'CREATED',
+            'purchase_units' => [['reference_id' => 'card-1']],
+            'payment_source' => ['card' => ['brand' => 'VISA', 'last_digits' => '5556']],
+        ]));
+
+        $intent = $this->gateway()->retrievePaymentIntent('ORDER-CARD', $this->reservation(['status' => 'awaiting_payment', 'payment_id' => 'ORDER-CARD']));
+
+        $this->assertSame('requires_payment_method', $intent->status);
+        $this->assertSame('ORDER-CARD', $intent->client_secret);
+    }
+
+    #[Test]
     public function a_completed_order_is_judged_by_its_capture_not_the_order_status(): void
     {
         // Reached when the capture route never stored the capture id: an ACDC processor decline
@@ -255,5 +278,105 @@ class GatewaySdkResponsesTest extends BootedAddonTestCase
         $this->assertSame('confirmed', $reservation->fresh()->status);
         $this->assertSame('CAPTURE-1', $reservation->fresh()->payment_id);
         Event::assertDispatchedTimes(ReservationConfirmed::class, 1);
+    }
+
+    #[Test]
+    public function a_second_capture_for_a_confirmed_reservation_alerts_the_admins(): void
+    {
+        // A capture that completed at PayPal after its capture call timed out, while the customer
+        // paid a replacement order: the booking is already paid, so this one charged them twice.
+        Mail::fake();
+        Event::fake([ReservationConfirmed::class]);
+        Config::set('resrv-config.admin_email', 'admin@example.com');
+        $verifier = Mockery::mock(WebhookSignatureVerifier::class);
+        $verifier->shouldReceive('verify')->andReturn(true);
+        $gateway = new PaypalPaymentGateway($verifier);
+
+        $cases = [
+            // The capture of another order than the one that paid.
+            'second capture' => ['CAPTURE-1', 'CAPTURE-2'],
+            // A redelivery of the capture that paid.
+            'redelivered' => ['CAPTURE-3', 'CAPTURE-3'],
+        ];
+
+        $alerts = [];
+        foreach ($cases as $label => [$paymentId, $captureId]) {
+            $reservation = $this->reservation(['status' => 'confirmed', 'payment_id' => $paymentId]);
+
+            $gateway->verifyPayment(Request::create('/', 'POST', [], [], [], ['CONTENT_TYPE' => 'application/json'], json_encode([
+                'id' => 'WH-'.$captureId,
+                'event_type' => 'PAYMENT.CAPTURE.COMPLETED',
+                'resource' => [
+                    'id' => $captureId,
+                    'status' => 'COMPLETED',
+                    'custom_id' => (string) $reservation->id,
+                    'amount' => ['currency_code' => 'EUR', 'value' => '55.00'],
+                ],
+            ])));
+
+            $alerts[$label] = Mail::sent(OrphanedPaymentNotification::class, fn ($mail) => $mail->paymentIntentId === $captureId)->count();
+            $this->assertSame(['confirmed', $paymentId], [$reservation->fresh()->status, $reservation->fresh()->payment_id], $label);
+            $reservation->delete();
+        }
+
+        $this->assertSame(['second capture' => 1, 'redelivered' => 0], $alerts);
+        Event::assertNotDispatched(ReservationConfirmed::class);
+    }
+
+    #[Test]
+    public function a_capture_that_loses_the_confirm_race_to_another_payment_alerts_the_admins(): void
+    {
+        // Two deliveries overlap: this webhook reads the reservation as payable, and another
+        // confirms it before this one's transition takes the row lock. Whether this capture is a
+        // second charge depends on which payment confirmed it, however the reservation was found.
+        Mail::fake();
+        Event::fake([ReservationConfirmed::class]);
+        Config::set('resrv-config.admin_email', 'admin@example.com');
+        $verifier = Mockery::mock(WebhookSignatureVerifier::class);
+        $verifier->shouldReceive('verify')->andReturn(true);
+        $gateway = new PaypalPaymentGateway($verifier);
+
+        $cases = [
+            // Found through custom_id (the capture route never stored its capture id).
+            'another capture confirmed it' => ['ORDER-1', 'CAPTURE-2', 1],
+            'this capture confirmed it' => ['ORDER-1', 'CAPTURE-1', 0],
+            // Found by payment_id (the capture route stored it); the other capture's webhook,
+            // found through custom_id, then confirmed the booking with its own capture id.
+            'another capture overwrote it' => ['CAPTURE-1', 'CAPTURE-2', 1],
+        ];
+
+        $alerts = [];
+        foreach ($cases as $label => [$paymentId, $confirmedWith, $expected]) {
+            $reservation = $this->reservation(['status' => 'pending', 'payment_id' => $paymentId]);
+
+            // The other delivery commits right after this webhook first reads the reservation.
+            $raced = false;
+            Reservation::retrieved(function (Reservation $read) use (&$raced, $reservation, $confirmedWith) {
+                if (! $raced && $read->id === $reservation->id) {
+                    $raced = true;
+                    Reservation::whereKey($reservation->id)->update(['status' => 'confirmed', 'payment_id' => $confirmedWith]);
+                }
+            });
+
+            $gateway->verifyPayment(Request::create('/', 'POST', [], [], [], ['CONTENT_TYPE' => 'application/json'], json_encode([
+                'id' => 'WH-'.$label,
+                'event_type' => 'PAYMENT.CAPTURE.COMPLETED',
+                'resource' => [
+                    'id' => 'CAPTURE-1',
+                    'status' => 'COMPLETED',
+                    'custom_id' => (string) $reservation->id,
+                    'amount' => ['currency_code' => 'EUR', 'value' => '55.00'],
+                ],
+            ])));
+
+            $this->assertTrue($raced, $label);
+            $this->assertSame(['confirmed', $confirmedWith], [$reservation->fresh()->status, $reservation->fresh()->payment_id], $label);
+            $alerts[$label] = Mail::sent(OrphanedPaymentNotification::class, fn ($mail) => $mail->reservation->id === $reservation->id && $mail->paymentIntentId === 'CAPTURE-1')->count();
+            $reservation->delete();
+        }
+
+        $this->assertSame(array_map(fn ($case) => $case[2], $cases), $alerts);
+        // The other delivery confirmed it; this one must not confirm it again.
+        Event::assertNotDispatched(ReservationConfirmed::class);
     }
 }

@@ -4,10 +4,17 @@ namespace Reach\ResrvPaymentPaypal\Http\Payment;
 
 use Illuminate\Support\Facades\Log;
 use PaypalServerSdkLib\Models\Builders\AmountWithBreakdownBuilder;
+use PaypalServerSdkLib\Models\Builders\CardAttributesBuilder;
+use PaypalServerSdkLib\Models\Builders\CardExperienceContextBuilder;
+use PaypalServerSdkLib\Models\Builders\CardRequestBuilder;
+use PaypalServerSdkLib\Models\Builders\CardVerificationBuilder;
 use PaypalServerSdkLib\Models\Builders\OrderRequestBuilder;
+use PaypalServerSdkLib\Models\Builders\PaymentSourceBuilder;
 use PaypalServerSdkLib\Models\Builders\PurchaseUnitRequestBuilder;
 use PaypalServerSdkLib\Models\Builders\RefundRequestBuilder;
 use PaypalServerSdkLib\Models\CheckoutPaymentIntent;
+use PaypalServerSdkLib\Models\Order;
+use PaypalServerSdkLib\Models\OrdersCardVerificationMethod;
 use Reach\StatamicResrv\Enums\ReservationStatus;
 use Reach\StatamicResrv\Events\ReservationConfirmed;
 use Reach\StatamicResrv\Exceptions\RefundFailedException;
@@ -19,6 +26,9 @@ use Reach\StatamicResrv\Models\Reservation;
 class PaypalPaymentGateway implements PaymentInterface
 {
     use PaypalApiTrait;
+
+    /** reference_id prefix of an order createOrder() made for the card fields. */
+    private const CARD_ORDER_REFERENCE = 'card-';
 
     protected WebhookSignatureVerifier $webhookVerifier;
 
@@ -68,36 +78,84 @@ class PaypalPaymentGateway implements PaymentInterface
             'entry_title' => $reservation->entry()->title,
         ]);
 
-        $ordersController = $this->client()->getOrdersController();
+        // The PayPal button pays this order. The card fields replace it with a card order on
+        // submit (createOrder() with a return URL, via PaypalCaptureController::replaceOrder()).
+        $orderId = $this->createOrder($reservation, $payment->format());
 
-        // Create order without payment source - JS SDK handles payment method selection
-        $orderRequest = OrderRequestBuilder::init(CheckoutPaymentIntent::CAPTURE, [
+        Log::info('PayPal: Order created successfully for JS SDK', [
+            'reservation_id' => $reservation->id,
+            'order_id' => $orderId,
+        ]);
+
+        $paymentIntent = new \stdClass;
+        $paymentIntent->id = $orderId;
+        // For JS SDK, we pass the order ID as client_secret (used by frontend)
+        $paymentIntent->client_secret = $orderId;
+
+        return $paymentIntent;
+    }
+
+    /**
+     * Create a PayPal order for the reservation and return its id. Without $cardReturnUrl the
+     * order has no payment source, which is what the PayPal button pays. With it the order is a
+     * card order: 3-D Secure is requested in the create-order body, the only place Card Fields
+     * read it (submit() takes no such option), with the configured verification method, and
+     * the return and cancel URLs PayPal asks for on every 3-D Secure request. A wallet order and
+     * a card order are never the same order: the card payment source has no business on an order
+     * the PayPal popup approves. A card order's reference_id marks it (see isCardOrder()).
+     *
+     * @throws PaypalApiException
+     */
+    public function createOrder(Reservation $reservation, string $amount, ?string $cardReturnUrl = null): string
+    {
+        $order = OrderRequestBuilder::init(CheckoutPaymentIntent::CAPTURE, [
             PurchaseUnitRequestBuilder::init(
-                AmountWithBreakdownBuilder::init(
-                    config('resrv-config.currency_isoCode'),
-                    $payment->format()
-                )->build()
+                AmountWithBreakdownBuilder::init(config('resrv-config.currency_isoCode'), $amount)->build()
             )
-                ->referenceId((string) $reservation->id)
+                ->referenceId(($cardReturnUrl === null ? '' : self::CARD_ORDER_REFERENCE).$reservation->id)
                 // custom_id rides onto the capture webhook (reference_id does not), so verifyPayment() can reconcile it.
                 ->customId((string) $reservation->id)
                 ->description($reservation->entry()->title)
                 ->build(),
-        ])->build();
-
-        $result = $this->paypalResult($ordersController->createOrder(['body' => $orderRequest]));
-
-        Log::info('PayPal: Order created successfully for JS SDK', [
-            'reservation_id' => $reservation->id,
-            'order_id' => $result->getId(),
         ]);
 
-        $paymentIntent = new \stdClass;
-        $paymentIntent->id = $result->getId();
-        // For JS SDK, we pass the order ID as client_secret (used by frontend)
-        $paymentIntent->client_secret = $result->getId();
+        if ($cardReturnUrl !== null) {
+            $order->paymentSource(PaymentSourceBuilder::init()->card(
+                CardRequestBuilder::init()
+                    ->attributes(CardAttributesBuilder::init()->verification(
+                        CardVerificationBuilder::init()->method(static::scaMethod())->build()
+                    )->build())
+                    ->experienceContext(CardExperienceContextBuilder::init()
+                        ->returnUrl($cardReturnUrl)
+                        ->cancelUrl($cardReturnUrl)
+                        ->build())
+                    ->build()
+            )->build());
+        }
 
-        return $paymentIntent;
+        return $this->paypalResult($this->client()->getOrdersController()->createOrder(['body' => $order->build()]))->getId();
+    }
+
+    /**
+     * The configured 3-D Secure method. A blank or unknown value falls back to SCA_WHEN_REQUIRED
+     * instead of reaching PayPal: an empty method breaks every card order, and AVS_CVV (which the
+     * Orders API also accepts) would switch 3-D Secure off.
+     */
+    public static function scaMethod(): string
+    {
+        $method = config('resrv-paypal.sca_method');
+
+        if (in_array($method, [OrdersCardVerificationMethod::SCA_ALWAYS, OrdersCardVerificationMethod::SCA_WHEN_REQUIRED], true)) {
+            return $method;
+        }
+
+        if (filled($method)) {
+            Log::warning('PayPal: PAYPAL_SCA_METHOD must be SCA_ALWAYS or SCA_WHEN_REQUIRED; using SCA_WHEN_REQUIRED', [
+                'sca_method' => $method,
+            ]);
+        }
+
+        return OrdersCardVerificationMethod::SCA_WHEN_REQUIRED;
     }
 
     /**
@@ -145,7 +203,11 @@ class PaypalPaymentGateway implements PaymentInterface
         // with no way to mint a replacement order. VOIDED is dead. Every other order status
         // (CREATED/SAVED/APPROVED/PAYER_ACTION_REQUIRED) is un-captured, and only our capture
         // route can take money for it — so it is payable exactly while that route would capture
-        // it, and the same order id is handed back to the JS SDK to finish.
+        // it, and the same order id is handed back to the JS SDK to finish. That includes a card
+        // order: the pay-by-link view swaps a resumed order for a wallet order before the PayPal
+        // button pays it, and the card fields mint a fresh card order on every submit. Reporting
+        // it canceled instead would let a concurrent pay() write a new order over a capture
+        // landing on this one.
         return $this->intentForResume($paymentId, match ($status) {
             'COMPLETED' => $this->captureResumeStatus($this->orderCaptureStatus($result)),
             'VOIDED' => 'canceled',
@@ -195,6 +257,15 @@ class PaypalPaymentGateway implements PaymentInterface
         $capture = $captures[0] ?? null;
 
         return is_array($capture) ? ($capture['status'] ?? null) : $capture?->getStatus();
+    }
+
+    /**
+     * Whether createOrder() made this order for the card fields, so it carries the 3-D Secure
+     * request. PayPal echoes the reference_id createOrder() set; the browser cannot change it.
+     */
+    public static function isCardOrder(Order $order): bool
+    {
+        return str_starts_with((string) ($order->getPurchaseUnits()[0] ?? null)?->getReferenceId(), self::CARD_ORDER_REFERENCE);
     }
 
     /**
@@ -574,6 +645,12 @@ class PaypalPaymentGateway implements PaymentInterface
 
         // status is a plain string column in Resrv v6 (not an enum cast), so compare against ->value.
         if ($reservation->status === ReservationStatus::CONFIRMED->value) {
+            // Found by payment_id, it is this capture's booking: a redelivery of the paying capture.
+            if ($eventType === 'PAYMENT.CAPTURE.COMPLETED' && $foundByCustomId
+                && $this->notifyIfPaidByAnotherPayment($reservation, $captureId, $eventId)) {
+                return response()->json([], 200);
+            }
+
             Log::info('PayPal: Webhook skipped - reservation already confirmed', [
                 'reservation_id' => $reservation->id,
                 'capture_id' => $captureId,
@@ -671,9 +748,11 @@ class PaypalPaymentGateway implements PaymentInterface
                 return response()->json([], 200);
             }
 
-            // Lost the confirm race (the row expired under the lock): surface any orphaned charge.
+            // Lost the confirm race: the row expired under the lock, or another payment confirmed
+            // it first (a second capture's webhook delivered at the same time). Surface the charge.
             $reservation->refresh();
-            OrphanedPaymentNotification::notifyIfOrphaned($reservation, $captureId, $eventId);
+            $this->notifyIfPaidByAnotherPayment($reservation, $captureId, $eventId)
+                || OrphanedPaymentNotification::notifyIfOrphaned($reservation, $captureId, $eventId);
 
             return response()->json([], 200);
         }
@@ -714,6 +793,29 @@ class PaypalPaymentGateway implements PaymentInterface
         ]);
 
         return response()->json([], 200);
+    }
+
+    /**
+     * Alert admins when this completed capture is not the payment that confirmed the booking:
+     * another payment already paid it, so this one charged the customer a second time. E.g. a
+     * capture that timed out at the capture route and completed after the customer paid a
+     * replacement order. A redelivery of the paying capture finds payment_id equal to it.
+     */
+    protected function notifyIfPaidByAnotherPayment(Reservation $reservation, string $captureId, ?string $eventId): bool
+    {
+        if ($reservation->status !== ReservationStatus::CONFIRMED->value || $reservation->payment_id === $captureId) {
+            return false;
+        }
+
+        Log::warning('PayPal: Capture completed for a reservation another payment already confirmed — manual refund likely required.', [
+            'reservation_id' => $reservation->id,
+            'capture_id' => $captureId,
+            'current_payment_id' => $reservation->payment_id,
+        ]);
+
+        OrphanedPaymentNotification::dispatchFor($reservation, $captureId, $eventId);
+
+        return true;
     }
 
     public function verifyWebhook()

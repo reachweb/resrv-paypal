@@ -25,14 +25,19 @@ PayPal payment gateway add-on for [Statamic Resrv](https://github.com/reachweb/s
 
 ## Upgrading from 1.0.1
 
-1.0.1 dropped trailing zeros from the amount on the card pay button: €316.80 read "Pay € 316.8".
-What changes for a site:
+1.0.1 never requested 3-D Secure for card-field payments: it passed a Hosted Fields option that
+Card Fields ignore, so every card payment was captured without authenticating the cardholder.
+Card payments now request 3-D Secure (see [3-D Secure](#3-d-secure-card-payments)). 1.0.1 also
+dropped trailing zeros from the amount on the card pay button: €316.80 read "Pay € 316.8". What
+changes for a site:
 
 - **Published payment view:** if you ran `vendor:publish --tag=resrv-paypal-views`, re-publish it
-  (`php artisan vendor:publish --tag=resrv-paypal-views --force`) and re-apply your edits, or
-  replace the button's `{{ $amount }}` with
-  `{{ \Reach\StatamicResrv\Facades\Price::create($amount)->format() }}`. The old copy keeps
-  showing "€ 316.8".
+  (`php artisan vendor:publish --tag=resrv-paypal-views --force`) and re-apply your edits. The old
+  copy pays cards on an order that never requested 3-D Secure, so its card payments are now
+  refused (payments with the PayPal button keep working), and it keeps showing "€ 316.8".
+- **Failed authentications are refused:** a card whose cardholder fails or cannot complete the
+  bank's check is not charged; the customer sees an error and can retry or pay with PayPal.
+- **New optional setting:** `PAYPAL_SCA_METHOD` (default `SCA_WHEN_REQUIRED`).
 
 ## Upgrading from 1.0.0
 
@@ -97,6 +102,41 @@ If you have configuration caching enabled, clear it after updating your `.env` f
 ```bash
 php artisan config:clear
 ```
+
+### 3-D Secure (card payments)
+
+Card-field payments request 3-D Secure (Strong Customer Authentication) from PayPal. Choose when
+the cardholder's bank is asked to authenticate them:
+
+```env
+PAYPAL_SCA_METHOD=SCA_WHEN_REQUIRED
+```
+
+- `SCA_WHEN_REQUIRED` (default): only when a regional mandate such as PSD2 requires it, for
+  example an EU merchant charging an EU-issued card. Other card payments go through without a
+  challenge, and the chargeback liability stays with you.
+- `SCA_ALWAYS`: every card payment the card and its bank support. More payments shift liability to
+  the card issuer, at the cost of a challenge step for more customers. A card payment that PayPal
+  reports with no authentication result at all is refused under this setting.
+
+The setting lives in `config/resrv-paypal.php` (`sca_method`). PayPal wallet payments are not
+affected: PayPal authenticates those itself.
+
+When PayPal reports the authentication result, the gateway follows
+[PayPal's recommended actions](https://developer.paypal.com/docs/checkout/advanced/customize/3d-secure/response-parameters/):
+the card is charged when liability shifted (`POSSIBLE`), when the card or its bank does not take
+part in 3-D Secure, or when no authentication was needed. It is **not** charged when the
+cardholder failed or could not complete authentication (`liability_shift` `NO` on an enrolled
+card), when the authentication system was unavailable (`UNKNOWN`), or when the card was paid on an
+order that never requested 3-D Secure (for example from an outdated published payment view); the
+customer sees an error and can try again or pay with PayPal.
+
+A blank or unrecognised `PAYPAL_SCA_METHOD` falls back to `SCA_WHEN_REQUIRED` and logs a warning.
+
+To test in sandbox, use PayPal's
+[3-D Secure test cards](https://developer.paypal.com/docs/checkout/advanced/customize/3d-secure/test/).
+The US cards may not be challenged under `SCA_WHEN_REQUIRED` (no mandate applies to them), so set
+`PAYPAL_SCA_METHOD=SCA_ALWAYS` while testing, or use the cards for your own region.
 
 ## Webhook Configuration (Required)
 
@@ -211,6 +251,18 @@ This publishes the view to `resources/views/vendor/resrv-paypal/livewire/checkou
 
 When you customize it, keep the script's contract with the server:
 
+- The card fields' `createOrder` must get its order from `POST /resrv-paypal/order/{orderId}/card`
+  (with the current order id), which creates the card order that carries the 3-D Secure request.
+  A card paid on the order the page was mounted with is refused at capture. The PayPal button pays
+  the mounted order on checkout; after a card attempt, and on the pay-by-link page (which can
+  resume a card order), it gets a wallet order from `POST /resrv-paypal/order/{orderId}/paypal`.
+- Either order route can answer with a capture result (`status`, `captureId`) instead of a new
+  order `id`: the current order had already been captured by an attempt whose response was lost.
+  Finish exactly as after a capture, and do not hand the SDK an order.
+- A 403 from an order route means the page's order id is no longer the reservation's (for example
+  a replacement that went through but whose response was lost). Do not retry with that id, or hand
+  it to the PayPal button, until you know the current one: on the pay-by-link page call
+  `$wire.pay()` and use the new `$wire.clientSecret`; on checkout ask the customer to reload.
 - After a successful capture, return the customer to `checkoutCompletedUrl` with the
   `capture_id` from the capture response (plus `resrv_gateway` and `redirect_status`). The
   checkout-complete page looks the reservation up by that capture id; it does not accept a

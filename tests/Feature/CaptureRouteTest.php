@@ -8,10 +8,13 @@ use PaypalServerSdkLib\Models\Order;
 use PaypalServerSdkLib\PaypalServerSdkClient;
 use PHPUnit\Framework\Attributes\Test;
 use Reach\ResrvPaymentPaypal\Tests\BootedAddonTestCase;
+use Reach\StatamicResrv\Http\Payment\FakePaymentGateway;
+use Reach\StatamicResrv\Http\Payment\PaymentGatewayManager;
+use Reach\StatamicResrv\Models\Reservation;
 
 /**
- * POST /resrv-paypal/capture/{orderId} through the route the add-on registers on boot, against the
- * responses paypal-server-sdk 2.x really returns.
+ * POST /resrv-paypal/capture/{orderId} and /resrv-paypal/order/{orderId}/{source} through the routes
+ * the add-on registers on boot, against the responses paypal-server-sdk 2.x really returns.
  */
 class CaptureRouteTest extends BootedAddonTestCase
 {
@@ -25,6 +28,51 @@ class CaptureRouteTest extends BootedAddonTestCase
         $client = Mockery::mock(PaypalServerSdkClient::class);
         $client->shouldReceive('getOrdersController')->andReturn($this->orders);
         $this->app->instance(PaypalServerSdkClient::class, $client);
+
+        // The capture route reads the order before capturing it. A wallet order carries no 3-D
+        // Secure result to judge.
+        $this->orders->shouldReceive('getOrder')->byDefault()->andReturn($this->paypalSuccess(Order::class, [
+            'id' => 'ORDER-1',
+            'status' => 'APPROVED',
+            'payment_source' => ['paypal' => ['email_address' => 'buyer@example.com']],
+        ]));
+    }
+
+    /**
+     * A card-funded order with the 3-D Secure result PayPal reports, or none. The reference_id is
+     * the one createOrder() gives a card order ('card-1'), or a wallet order's ('1'). A card order
+     * reads CREATED after the card fields approve it, not APPROVED (seen in the PayPal sandbox).
+     */
+    protected function cardOrder(?string $liabilityShift = null, ?string $enrollmentStatus = null, ?string $authenticationStatus = null, string $referenceId = 'card-1', string $status = 'CREATED')
+    {
+        $card = ['brand' => 'VISA', 'last_digits' => '1368'];
+
+        if ($liabilityShift !== null) {
+            $card['authentication_result'] = [
+                'liability_shift' => $liabilityShift,
+                'three_d_secure' => array_filter([
+                    'enrollment_status' => $enrollmentStatus,
+                    'authentication_status' => $authenticationStatus,
+                ]),
+            ];
+        }
+
+        return $this->paypalSuccess(Order::class, [
+            'id' => 'ORDER-1',
+            'status' => $status,
+            'purchase_units' => [['reference_id' => $referenceId, 'amount' => ['currency_code' => 'EUR', 'value' => '55.00']]],
+            'payment_source' => ['card' => $card],
+        ]);
+    }
+
+    /** The create-order body PayPal receives, as JSON. */
+    protected function expectOrderCreation(string $newOrderId, ?array &$body)
+    {
+        return $this->orders->shouldReceive('createOrder')->once()->andReturnUsing(function ($options) use ($newOrderId, &$body) {
+            $body = json_decode(json_encode($options['body']), true);
+
+            return $this->paypalSuccess(Order::class, ['id' => $newOrderId, 'status' => 'CREATED'], 201);
+        });
     }
 
     protected function completedOrder(string $captureStatus = 'COMPLETED'): array
@@ -78,15 +126,34 @@ class CaptureRouteTest extends BootedAddonTestCase
     }
 
     #[Test]
-    public function a_retried_capture_of_an_already_captured_order_reports_the_capture(): void
+    public function a_retried_capture_of_an_already_captured_order_reports_the_capture_without_capturing_again(): void
     {
         // The first attempt captured but its response never arrived (timeout); the retry must not
         // tell a paying customer the payment was declined.
         $reservation = $this->reservation(['status' => 'pending', 'payment_id' => 'ORDER-1']);
-        $this->orders->shouldReceive('captureOrder')
-            ->andReturn($this->paypalError(422, 'UNPROCESSABLE_ENTITY', ['ORDER_ALREADY_CAPTURED']));
         $this->orders->shouldReceive('getOrder')->with(['id' => 'ORDER-1'])
             ->andReturn($this->paypalSuccess(Order::class, $this->completedOrder()));
+        $this->orders->shouldNotReceive('captureOrder');
+
+        $this->withSession(['resrv_reservation' => $reservation->id])
+            ->postJson('/resrv-paypal/capture/ORDER-1')
+            ->assertOk()
+            ->assertJson(['status' => 'COMPLETED', 'captureId' => 'CAPTURE-1']);
+
+        $this->assertSame('CAPTURE-1', $reservation->fresh()->payment_id);
+    }
+
+    #[Test]
+    public function a_capture_that_lands_after_the_order_was_read_reports_the_capture(): void
+    {
+        // Another attempt captured between this one's read (APPROVED) and its capture call.
+        $reservation = $this->reservation(['status' => 'pending', 'payment_id' => 'ORDER-1']);
+        $this->orders->shouldReceive('captureOrder')
+            ->andReturn($this->paypalError(422, 'UNPROCESSABLE_ENTITY', ['ORDER_ALREADY_CAPTURED']));
+        $this->orders->shouldReceive('getOrder')->with(['id' => 'ORDER-1'])->andReturn(
+            $this->paypalSuccess(Order::class, ['id' => 'ORDER-1', 'status' => 'APPROVED']),
+            $this->paypalSuccess(Order::class, $this->completedOrder()),
+        );
 
         $this->withSession(['resrv_reservation' => $reservation->id])
             ->postJson('/resrv-paypal/capture/ORDER-1')
@@ -190,5 +257,394 @@ class CaptureRouteTest extends BootedAddonTestCase
             'confirmed, owning session' => 403,
             'cancelled, owning session' => 403,
         ], $results);
+    }
+
+    #[Test]
+    public function a_transition_during_the_paypal_call_voids_the_order(): void
+    {
+        // Each route checks the reservation without a lock, calls PayPal, then checks again under
+        // the row lock. Only that second check sees a transition that committed during the call
+        // (an admin marks it paid or cancels it, the hold sweep): it is what voids the order.
+        $transition = null;
+        $reservationId = null;
+        $commit = function () use (&$transition, &$reservationId) {
+            Reservation::whereKey($reservationId)->update(['status' => $transition]);
+        };
+        $this->orders->shouldReceive('getOrder')->andReturnUsing(function () use ($commit) {
+            $commit();
+
+            return $this->paypalSuccess(Order::class, ['id' => 'ORDER-1', 'status' => 'APPROVED', 'payment_source' => ['paypal' => ['email_address' => 'buyer@example.com']]]);
+        });
+        $this->orders->shouldReceive('createOrder')->andReturnUsing(function () use ($commit) {
+            $commit();
+
+            return $this->paypalSuccess(Order::class, ['id' => 'ORDER-2', 'status' => 'CREATED'], 201);
+        });
+        $this->orders->shouldNotReceive('captureOrder');
+
+        $results = [];
+        foreach (['capture/ORDER-1', 'order/ORDER-1/card'] as $route) {
+            foreach (['confirmed', 'cancelled'] as $transition) {
+                $reservation = $this->reservation(['status' => 'pending', 'payment_id' => 'ORDER-1']);
+                $reservationId = $reservation->id;
+
+                $status = $this->withSession(['resrv_reservation' => $reservation->id])->postJson("/resrv-paypal/{$route}")->status();
+
+                $results["{$route}, {$transition}"] = [$status, $reservation->fresh()->payment_id];
+                $reservation->delete();
+            }
+        }
+
+        $this->assertSame([
+            'capture/ORDER-1, confirmed' => [403, 'ORDER-1'],
+            'capture/ORDER-1, cancelled' => [403, 'ORDER-1'],
+            'order/ORDER-1/card, confirmed' => [403, 'ORDER-1'],
+            'order/ORDER-1/card, cancelled' => [403, 'ORDER-1'],
+        ], $results);
+    }
+
+    #[Test]
+    public function a_card_order_is_captured_only_when_its_3ds_outcome_allows_it(): void
+    {
+        // PayPal's recommended action for each liability_shift / enrollment_status /
+        // authentication_status it reports (3-D Secure response parameters). PayPal captures
+        // every one of these if asked, so the route must refuse before capturing.
+        $cases = [
+            'step-up succeeded' => ['POSSIBLE', 'Y', 'Y'],
+            'attempted' => ['POSSIBLE', 'Y', 'A'],
+            'step-up failed' => ['NO', 'Y', 'N'],
+            'rejected' => ['NO', 'Y', 'R'],
+            'issuer unavailable' => ['NO', 'Y', 'U'],
+            'enrolled, no authentication' => ['NO', 'Y', null],
+            'system unavailable' => ['UNKNOWN', 'Y', 'C'],
+            'lookup unavailable, unknown' => ['UNKNOWN', 'U', null],
+            'not enrolled' => ['NO', 'N', null],
+            'lookup unavailable' => ['NO', 'U', null],
+            'bypassed' => ['NO', 'B', null],
+            '3-D Secure not performed' => [null],
+            // Approved by the card fields on the wallet order, which carried no 3-D Secure request.
+            'card on a wallet order' => [null, 'referenceId' => '1'],
+            'step-up succeeded, APPROVED' => ['POSSIBLE', 'Y', 'Y', 'status' => 'APPROVED'],
+            'step-up failed, APPROVED' => ['NO', 'Y', 'N', 'status' => 'APPROVED'],
+            // Read before the challenge finished: no result to judge yet.
+            'challenge not finished' => [null, 'status' => 'PAYER_ACTION_REQUIRED'],
+            'voided' => ['POSSIBLE', 'Y', 'Y', 'status' => 'VOIDED'],
+        ];
+
+        $refused = '400 Card authentication failed';
+        $this->assertSame([
+            'step-up succeeded' => 'captured',
+            'attempted' => 'captured',
+            'step-up failed' => $refused,
+            'rejected' => $refused,
+            'issuer unavailable' => $refused,
+            'enrolled, no authentication' => $refused,
+            'system unavailable' => $refused,
+            'lookup unavailable, unknown' => $refused,
+            'not enrolled' => 'captured',
+            'lookup unavailable' => 'captured',
+            'bypassed' => 'captured',
+            '3-D Secure not performed' => 'captured',
+            'card on a wallet order' => $refused,
+            'step-up succeeded, APPROVED' => 'captured',
+            'step-up failed, APPROVED' => $refused,
+            'challenge not finished' => '400 Payment declined',
+            'voided' => '400 Payment declined',
+        ], $this->captureOutcomes($cases));
+    }
+
+    #[Test]
+    public function under_sca_always_a_card_order_needs_a_3ds_result(): void
+    {
+        config(['resrv-paypal.sca_method' => 'SCA_ALWAYS']);
+
+        // Nothing shows 3-D Secure ran (the browser confirmed the card on the card order without
+        // it), so the merchant's "every card payment" setting is not met. A card or issuer that
+        // does not take part still reports a result, and is captured as under SCA_WHEN_REQUIRED.
+        $this->assertSame([
+            '3-D Secure not performed' => '400 Card authentication failed',
+            'not enrolled' => 'captured',
+            'step-up succeeded' => 'captured',
+            'step-up failed' => '400 Card authentication failed',
+        ], $this->captureOutcomes([
+            '3-D Secure not performed' => [null],
+            'not enrolled' => ['NO', 'N', null],
+            'step-up succeeded' => ['POSSIBLE', 'Y', 'Y'],
+            'step-up failed' => ['NO', 'Y', 'N'],
+        ]));
+    }
+
+    /**
+     * What the capture route does with each card order: 'captured', or the refusal's status and
+     * error. A refused order must stay the reservation's payment_id, so the customer can retry.
+     *
+     * @param  array<string, array>  $cases  cardOrder() arguments by label
+     */
+    protected function captureOutcomes(array $cases): array
+    {
+        $order = null;
+        $captured = false;
+        $this->orders->shouldReceive('getOrder')->andReturnUsing(function () use (&$order) {
+            return $order;
+        });
+        $this->orders->shouldReceive('captureOrder')->andReturnUsing(function () use (&$captured) {
+            $captured = true;
+
+            return $this->paypalSuccess(Order::class, $this->completedOrder(), 201);
+        });
+
+        $results = [];
+        foreach ($cases as $label => $authentication) {
+            $order = $this->cardOrder(...$authentication);
+            $captured = false;
+            $reservation = $this->reservation(['status' => 'pending', 'payment_id' => 'ORDER-1']);
+
+            $response = $this->withSession(['resrv_reservation' => $reservation->id])->postJson('/resrv-paypal/capture/ORDER-1');
+
+            $results[$label] = $captured ? 'captured' : $response->status().' '.$response->json('error');
+            if (! $captured) {
+                $this->assertSame('ORDER-1', $reservation->fresh()->payment_id, $label);
+            }
+            $reservation->delete();
+        }
+
+        return $results;
+    }
+
+    #[Test]
+    public function an_unapproved_order_without_a_card_is_not_captured(): void
+    {
+        // Nobody has approved the order the page was mounted with. The read is taken before the
+        // lock, so a card confirmed on it afterwards (a script handing the wallet order to the
+        // card fields) would reach PayPal without the 3-D Secure checks.
+        $reservation = $this->reservation(['status' => 'pending', 'payment_id' => 'ORDER-1']);
+        $this->orders->shouldReceive('getOrder')->andReturn($this->paypalSuccess(Order::class, [
+            'id' => 'ORDER-1',
+            'status' => 'CREATED',
+            'purchase_units' => [['reference_id' => (string) $reservation->id, 'amount' => ['currency_code' => 'EUR', 'value' => '55.00']]],
+        ]));
+        $this->orders->shouldNotReceive('captureOrder');
+
+        $this->withSession(['resrv_reservation' => $reservation->id])
+            ->postJson('/resrv-paypal/capture/ORDER-1')
+            ->assertStatus(400)
+            ->assertJson(['error' => 'Payment declined']);
+
+        $this->assertSame('ORDER-1', $reservation->fresh()->payment_id);
+    }
+
+    #[Test]
+    public function an_order_that_cannot_be_read_before_capture_is_not_captured(): void
+    {
+        $reservation = $this->reservation(['status' => 'pending', 'payment_id' => 'ORDER-1']);
+        $this->orders->shouldReceive('getOrder')->andReturn($this->paypalError(503, 'SERVICE_UNAVAILABLE'));
+        $this->orders->shouldNotReceive('captureOrder');
+
+        $this->withSession(['resrv_reservation' => $reservation->id])
+            ->postJson('/resrv-paypal/capture/ORDER-1')
+            ->assertStatus(502)
+            ->assertJson(['error' => 'Capture failed']);
+
+        $this->assertSame('ORDER-1', $reservation->fresh()->payment_id);
+    }
+
+    #[Test]
+    public function a_card_submit_replaces_the_order_with_one_that_requests_3ds(): void
+    {
+        $reservation = $this->reservation(['status' => 'pending', 'payment_id' => 'ORDER-1']);
+        $this->expectOrderCreation('ORDER-CARD', $body);
+        // The first card submit replaces the order the page was mounted with, which nobody has
+        // approved: CREATED, with no payment source.
+        $this->orders->shouldReceive('getOrder')->andReturn($this->paypalSuccess(Order::class, ['id' => 'ORDER-1', 'status' => 'CREATED']));
+
+        $this->withSession(['resrv_reservation' => $reservation->id])
+            ->withHeader('referer', 'https://site.test/checkout?step=3')
+            ->postJson('/resrv-paypal/order/ORDER-1/card')
+            ->assertOk()
+            ->assertExactJson(['id' => 'ORDER-CARD']);
+
+        // PayPal reads the 3-D Secure request from the create-order body; SCA_WHEN_REQUIRED unless configured.
+        $this->assertSame([
+            'card' => [
+                'attributes' => ['verification' => ['method' => 'SCA_WHEN_REQUIRED']],
+                'experience_context' => [
+                    'return_url' => 'https://site.test/checkout?step=3',
+                    'cancel_url' => 'https://site.test/checkout?step=3',
+                ],
+            ],
+        ], $body['payment_source']);
+        // Payment + surcharge, with custom_id for the webhook's reconciliation, and the reference_id
+        // that tells the capture route this order carries the 3-D Secure request.
+        $this->assertSame(['currency_code' => 'EUR', 'value' => '55.00'], $body['purchase_units'][0]['amount']);
+        $this->assertSame((string) $reservation->id, $body['purchase_units'][0]['custom_id']);
+        $this->assertSame('card-'.$reservation->id, $body['purchase_units'][0]['reference_id']);
+        $this->assertSame('ORDER-CARD', $reservation->fresh()->payment_id);
+
+        // The replaced wallet order can no longer be captured.
+        $this->orders->shouldNotReceive('captureOrder');
+        $this->withSession(['resrv_reservation' => $reservation->id])
+            ->postJson('/resrv-paypal/capture/ORDER-1')
+            ->assertForbidden();
+    }
+
+    #[Test]
+    public function the_3ds_verification_method_follows_the_configuration(): void
+    {
+        $method = null;
+        $this->orders->shouldReceive('createOrder')->andReturnUsing(function ($options) use (&$method) {
+            $method = json_decode(json_encode($options['body']), true)['payment_source']['card']['attributes']['verification']['method'];
+
+            return $this->paypalSuccess(Order::class, ['id' => 'ORDER-CARD', 'status' => 'CREATED'], 201);
+        });
+
+        // A blank PAYPAL_SCA_METHOD= reads as '', and AVS_CVV is a method PayPal accepts that
+        // skips 3-D Secure: neither may reach PayPal.
+        $methods = [];
+        foreach (['SCA_ALWAYS', 'SCA_WHEN_REQUIRED', '', null, 'AVS_CVV', 'sca_always'] as $configured) {
+            config(['resrv-paypal.sca_method' => $configured]);
+            $reservation = $this->reservation(['status' => 'awaiting_payment', 'payment_id' => 'ORDER-1', 'hold_expires_at' => now()->addDay()]);
+
+            $this->postJson('/resrv-paypal/order/ORDER-1/card')->assertOk();
+
+            $methods[var_export($configured, true)] = $method;
+            $reservation->delete();
+        }
+
+        $this->assertSame([
+            "'SCA_ALWAYS'" => 'SCA_ALWAYS',
+            "'SCA_WHEN_REQUIRED'" => 'SCA_WHEN_REQUIRED',
+            "''" => 'SCA_WHEN_REQUIRED',
+            'NULL' => 'SCA_WHEN_REQUIRED',
+            "'AVS_CVV'" => 'SCA_WHEN_REQUIRED',
+            "'sca_always'" => 'SCA_WHEN_REQUIRED',
+        ], $methods);
+    }
+
+    #[Test]
+    public function the_paypal_button_swaps_a_card_order_back_for_a_wallet_order(): void
+    {
+        $reservation = $this->reservation(['status' => 'pending', 'payment_id' => 'ORDER-CARD']);
+        $this->expectOrderCreation('ORDER-2', $body);
+        // A card order the capture route refused after 3-D Secure.
+        $this->orders->shouldReceive('getOrder')->andReturn($this->cardOrder('NO', 'Y', 'N'));
+
+        $this->withSession(['resrv_reservation' => $reservation->id])
+            ->postJson('/resrv-paypal/order/ORDER-CARD/paypal')
+            ->assertOk()
+            ->assertExactJson(['id' => 'ORDER-2']);
+
+        $this->assertArrayNotHasKey('payment_source', $body);
+        $this->assertSame((string) $reservation->id, $body['purchase_units'][0]['reference_id']);
+        $this->assertSame('55.00', $body['purchase_units'][0]['amount']['value']);
+        $this->assertSame('ORDER-2', $reservation->fresh()->payment_id);
+    }
+
+    #[Test]
+    public function replacing_an_order_that_was_already_captured_keeps_that_payment(): void
+    {
+        // The capture reached PayPal but its response was lost, so payment_id still names the
+        // order. Minting a replacement would let the customer pay a second time.
+        $reservation = $this->reservation(['status' => 'pending', 'payment_id' => 'ORDER-1']);
+        $this->orders->shouldReceive('getOrder')->with(['id' => 'ORDER-1'])
+            ->andReturn($this->paypalSuccess(Order::class, $this->completedOrder()));
+        $this->orders->shouldReceive('createOrder')
+            ->andReturn($this->paypalSuccess(Order::class, ['id' => 'ORDER-2', 'status' => 'CREATED'], 201));
+
+        $this->withSession(['resrv_reservation' => $reservation->id])
+            ->postJson('/resrv-paypal/order/ORDER-1/card')
+            ->assertOk()
+            ->assertJson(['status' => 'COMPLETED', 'captureId' => 'CAPTURE-1'])
+            ->assertJsonMissingPath('id');
+
+        $this->assertSame('CAPTURE-1', $reservation->fresh()->payment_id);
+    }
+
+    #[Test]
+    public function only_an_unpaid_order_is_replaced(): void
+    {
+        $this->orders->shouldReceive('createOrder')
+            ->andReturn($this->paypalSuccess(Order::class, ['id' => 'ORDER-2', 'status' => 'CREATED'], 201));
+
+        $cases = [
+            // A stored capture id (the capture id is in the return URL): not an order at all.
+            'capture id' => ['CAPTURE-1', $this->paypalError(404, 'RESOURCE_NOT_FOUND', ['INVALID_RESOURCE_ID'])],
+            'voided order' => ['ORDER-1', $this->paypalSuccess(Order::class, ['id' => 'ORDER-1', 'status' => 'VOIDED'])],
+            // The order the page was mounted with, before anyone approved it.
+            'unapproved order' => ['ORDER-1', $this->paypalSuccess(Order::class, ['id' => 'ORDER-1', 'status' => 'CREATED'])],
+            'approved order' => ['ORDER-1', $this->paypalSuccess(Order::class, ['id' => 'ORDER-1', 'status' => 'APPROVED'])],
+            // A card order after 3-D Secure, and one whose challenge the customer closed.
+            'card order' => ['ORDER-1', $this->cardOrder('NO', 'Y', 'N')],
+            'challenge not finished' => ['ORDER-1', $this->cardOrder(status: 'PAYER_ACTION_REQUIRED')],
+            'saved order' => ['ORDER-1', $this->paypalSuccess(Order::class, ['id' => 'ORDER-1', 'status' => 'SAVED'])],
+        ];
+
+        $order = null;
+        $this->orders->shouldReceive('getOrder')->andReturnUsing(function () use (&$order) {
+            return $order;
+        });
+
+        $results = [];
+        foreach ($cases as $label => [$paymentId, $order]) {
+            $reservation = $this->reservation(['status' => 'awaiting_payment', 'payment_id' => $paymentId, 'hold_expires_at' => now()->addDay()]);
+
+            $status = $this->postJson("/resrv-paypal/order/{$paymentId}/paypal")->status();
+
+            $results[$label] = [$status, $reservation->fresh()->payment_id];
+            $reservation->delete();
+        }
+
+        $this->assertSame([
+            'capture id' => [502, 'CAPTURE-1'],
+            'voided order' => [403, 'ORDER-1'],
+            'unapproved order' => [200, 'ORDER-2'],
+            'approved order' => [200, 'ORDER-2'],
+            'card order' => [200, 'ORDER-2'],
+            'challenge not finished' => [200, 'ORDER-2'],
+            'saved order' => [200, 'ORDER-2'],
+        ], $results);
+    }
+
+    #[Test]
+    public function neither_route_acts_on_another_gateways_reservation(): void
+    {
+        // A Stripe intent id is in Stripe's client secret on the page. Taking it over would mint a
+        // PayPal order at Stripe's surcharge, and its refund would go to Stripe.
+        config(['resrv-config.payment_gateways.stripe' => ['class' => FakePaymentGateway::class]]);
+        app()->forgetInstance(PaymentGatewayManager::class);
+        $reservation = $this->reservation(['status' => 'pending', 'payment_gateway' => 'stripe', 'payment_id' => 'pi_123']);
+        $this->orders->shouldNotReceive('createOrder');
+        $this->orders->shouldNotReceive('getOrder');
+        $this->orders->shouldNotReceive('captureOrder');
+
+        $this->withSession(['resrv_reservation' => $reservation->id])->postJson('/resrv-paypal/order/pi_123/paypal')->assertForbidden();
+        $this->withSession(['resrv_reservation' => $reservation->id])->postJson('/resrv-paypal/capture/pi_123')->assertForbidden();
+
+        $this->assertSame('pi_123', $reservation->fresh()->payment_id);
+    }
+
+    #[Test]
+    public function an_order_replacement_is_authorised_like_a_capture(): void
+    {
+        $this->orders->shouldNotReceive('createOrder');
+        $reservation = $this->reservation(['status' => 'pending', 'payment_id' => 'ORDER-1']);
+
+        $this->postJson('/resrv-paypal/order/ORDER-NOPE/card')->assertForbidden();
+        $this->postJson('/resrv-paypal/order/ORDER-1/card')->assertForbidden();
+        $this->withSession(['resrv_reservation' => $reservation->id])->postJson('/resrv-paypal/order/ORDER-1/venmo')->assertNotFound();
+
+        $this->assertSame('ORDER-1', $reservation->fresh()->payment_id);
+    }
+
+    #[Test]
+    public function a_failed_order_replacement_keeps_the_current_order(): void
+    {
+        $reservation = $this->reservation(['status' => 'pending', 'payment_id' => 'ORDER-1']);
+        $this->orders->shouldReceive('createOrder')->andReturn($this->paypalError(422, 'UNPROCESSABLE_ENTITY', ['INVALID_PARAMETER_VALUE']));
+
+        $response = $this->withSession(['resrv_reservation' => $reservation->id])->postJson('/resrv-paypal/order/ORDER-1/card');
+
+        $response->assertStatus(502)->assertJson(['error' => 'Order failed']);
+        $this->assertStringNotContainsString('INVALID_PARAMETER_VALUE', $response->getContent());
+        $this->assertSame('ORDER-1', $reservation->fresh()->payment_id);
     }
 }
