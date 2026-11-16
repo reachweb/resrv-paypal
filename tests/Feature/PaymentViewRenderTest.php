@@ -34,6 +34,7 @@ class PaymentViewRenderTest extends AddonTestCase
         $app['config']->set('app.key', 'base64:2fl+Ktvkfl+Fuz4Qp/A75G2RTiWVA/ZoKZvp6fiiM10=');
         $app['config']->set('services.paypal.mode', 'sandbox');
         $app['config']->set('resrv-config.currency_isoCode', 'EUR');
+        $app['config']->set('resrv-config.currency_symbol', '€');
     }
 
     #[Test]
@@ -43,7 +44,18 @@ class PaymentViewRenderTest extends AddonTestCase
             ->assertSeeHtml('id="paypal-button-container"')
             ->assertSeeHtml('id="card-number-field-container"')
             ->assertSeeHtml('currency=EUR')
+            ->assertSeeHtml('€ 316.80')
             ->assertSeeHtml('canRemintInline: false');
+    }
+
+    #[Test]
+    public function it_shows_a_zero_decimal_currency_without_decimals(): void
+    {
+        config(['resrv-config.currency_isoCode' => 'JPY', 'resrv-config.currency_symbol' => '¥']);
+
+        // The yen has no minor unit: a fixed two-decimal format would print "¥ 3,168.00".
+        Livewire::test(CheckoutSurfaceStub::class, ['amount' => 3168.0])
+            ->assertSeeHtml('¥ 3168</span>');
     }
 
     #[Test]
@@ -61,7 +73,8 @@ class CheckoutSurfaceStub extends Component
 
     public string $publicKey = 'client-id';
 
-    public float $amount = 55.0;
+    // Both payment surfaces pass the amount as a float, which drops the trailing zero (316.8).
+    public float $amount = 316.80;
 
     public string $checkoutCompletedUrl = 'https://example.com/checkout-complete';
 

@@ -23,6 +23,17 @@ PayPal payment gateway add-on for [Statamic Resrv](https://github.com/reachweb/s
 > Resrv 6.5 or later; there is no release for Resrv 5, so a Resrv 5 site has to stay on the last
 > compatible commit: `composer require reachweb/resrv-payment-paypal:dev-main#049bfa9`.
 
+## Upgrading from 1.0.1
+
+1.0.1 dropped trailing zeros from the amount on the card pay button: €316.80 read "Pay € 316.8".
+What changes for a site:
+
+- **Published payment view:** if you ran `vendor:publish --tag=resrv-paypal-views`, re-publish it
+  (`php artisan vendor:publish --tag=resrv-paypal-views --force`) and re-apply your edits, or
+  replace the button's `{{ $amount }}` with
+  `{{ \Reach\StatamicResrv\Facades\Price::create($amount)->format() }}`. The old copy keeps
+  showing "€ 316.8".
+
 ## Upgrading from 1.0.0
 
 v1.0.0 could not take payments: the payment view failed to render, and a refund PayPal rejected
