@@ -645,20 +645,9 @@ class PaypalPaymentGateway implements PaymentInterface
 
         // status is a plain string column in Resrv v6 (not an enum cast), so compare against ->value.
         if ($reservation->status === ReservationStatus::CONFIRMED->value) {
-            // Another payment already paid this booking, so this capture charged the customer a
-            // second time: e.g. a capture that timed out at the capture route and completed after
-            // the customer paid a replacement order. A redelivery of the paying capture is found
-            // by payment_id, unless another delivery confirmed the booking with this capture id
-            // between that lookup and the custom_id one: then payment_id is this capture.
-            if ($eventType === 'PAYMENT.CAPTURE.COMPLETED' && $foundByCustomId && $reservation->payment_id !== $captureId) {
-                Log::warning('PayPal: Capture completed for a reservation another payment already confirmed — manual refund likely required.', [
-                    'reservation_id' => $reservation->id,
-                    'capture_id' => $captureId,
-                    'current_payment_id' => $reservation->payment_id,
-                ]);
-
-                OrphanedPaymentNotification::dispatchFor($reservation, $captureId, $eventId);
-
+            // Found by payment_id, it is this capture's booking: a redelivery of the paying capture.
+            if ($eventType === 'PAYMENT.CAPTURE.COMPLETED' && $foundByCustomId
+                && $this->notifyIfPaidByAnotherPayment($reservation, $captureId, $eventId)) {
                 return response()->json([], 200);
             }
 
@@ -759,9 +748,11 @@ class PaypalPaymentGateway implements PaymentInterface
                 return response()->json([], 200);
             }
 
-            // Lost the confirm race (the row expired under the lock): surface any orphaned charge.
+            // Lost the confirm race: the row expired under the lock, or another payment confirmed
+            // it first (a second capture's webhook delivered at the same time). Surface the charge.
             $reservation->refresh();
-            OrphanedPaymentNotification::notifyIfOrphaned($reservation, $captureId, $eventId);
+            $this->notifyIfPaidByAnotherPayment($reservation, $captureId, $eventId)
+                || OrphanedPaymentNotification::notifyIfOrphaned($reservation, $captureId, $eventId);
 
             return response()->json([], 200);
         }
@@ -802,6 +793,29 @@ class PaypalPaymentGateway implements PaymentInterface
         ]);
 
         return response()->json([], 200);
+    }
+
+    /**
+     * Alert admins when this completed capture is not the payment that confirmed the booking:
+     * another payment already paid it, so this one charged the customer a second time. E.g. a
+     * capture that timed out at the capture route and completed after the customer paid a
+     * replacement order. A redelivery of the paying capture finds payment_id equal to it.
+     */
+    protected function notifyIfPaidByAnotherPayment(Reservation $reservation, string $captureId, ?string $eventId): bool
+    {
+        if ($reservation->status !== ReservationStatus::CONFIRMED->value || $reservation->payment_id === $captureId) {
+            return false;
+        }
+
+        Log::warning('PayPal: Capture completed for a reservation another payment already confirmed — manual refund likely required.', [
+            'reservation_id' => $reservation->id,
+            'capture_id' => $captureId,
+            'current_payment_id' => $reservation->payment_id,
+        ]);
+
+        OrphanedPaymentNotification::dispatchFor($reservation, $captureId, $eventId);
+
+        return true;
     }
 
     public function verifyWebhook()
