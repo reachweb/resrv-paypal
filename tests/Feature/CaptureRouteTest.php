@@ -476,7 +476,7 @@ class CaptureRouteTest extends BootedAddonTestCase
         // Payment + surcharge, with custom_id for the webhook's reconciliation, and the reference_id
         // that tells the capture route this order carries the 3-D Secure request.
         $this->assertSame(['currency_code' => 'EUR', 'value' => '55.00'], $body['purchase_units'][0]['amount']);
-        $this->assertSame((string) $reservation->id, $body['purchase_units'][0]['custom_id']);
+        $this->assertSame($reservation->id.':'.$reservation->reference, $body['purchase_units'][0]['custom_id']);
         $this->assertSame('card-'.$reservation->id, $body['purchase_units'][0]['reference_id']);
         $this->assertSame('ORDER-CARD', $reservation->fresh()->payment_id);
 

@@ -157,6 +157,7 @@ class PaypalPaymentGatewayTest extends TestCase
         // Mock the Reservation class with shouldIgnoreMissing to handle Eloquent's setAttribute
         $reservation = Mockery::mock(Reservation::class)->shouldIgnoreMissing();
         $reservation->shouldReceive('getAttribute')->with('id')->andReturn(123);
+        $reservation->shouldReceive('getAttribute')->with('reference')->andReturn('ABC123');
         $reservation->shouldReceive('entry')->andReturn($entry);
         $reservation->id = 123;
 
@@ -179,12 +180,12 @@ class PaypalPaymentGatewayTest extends TestCase
                     return false;
                 }
 
-                // The reservation id must ride along as custom_id (as well as reference_id) so a
-                // capture webhook can be reconciled back to its reservation even after payment_id
-                // has been cleared by Resrv.
+                // The reservation id and reference must ride along as custom_id (the id also as
+                // reference_id) so a capture webhook can be reconciled back to its reservation even
+                // after payment_id has been cleared by Resrv.
                 $purchaseUnit = $args['body']->getPurchaseUnits()[0];
 
-                return $purchaseUnit->getCustomId() === '123'
+                return $purchaseUnit->getCustomId() === '123:ABC123'
                     && $purchaseUnit->getReferenceId() === '123';
             }))
             ->andReturn($response);

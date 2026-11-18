@@ -114,7 +114,8 @@ class PaypalPaymentGateway implements PaymentInterface
             )
                 ->referenceId(($cardReturnUrl === null ? '' : self::CARD_ORDER_REFERENCE).$reservation->id)
                 // custom_id rides onto the capture webhook (reference_id does not), so verifyPayment() can reconcile it.
-                ->customId((string) $reservation->id)
+                // The reference tells this site's reservation from another site's with the same id.
+                ->customId($reservation->id.':'.$reservation->reference)
                 ->description($reservation->entry()->title)
                 ->build(),
         ]);
@@ -611,15 +612,25 @@ class PaypalPaymentGateway implements PaymentInterface
         //      capture we should confirm normally.
         // custom_id carries the reservation id onto the capture (reference_id does not), so recover the
         // reservation from there and only treat it as stale when payment_id was actually cleared.
+        // PayPal posts every capture of an app to each of its webhooks, so another site sharing the
+        // app sends its own captures here, and its reservation can share the id: the reference after
+        // the id must match as well. Orders created before the reference was stored match on the id.
         $isStaleIntent = false;
         $foundByCustomId = false;
+        $referenceMatched = false;
 
         if (! $reservation) {
-            $referenceId = $data['resource']['custom_id'] ?? null;
+            [$reservationId, $reference] = array_pad(explode(':', (string) ($data['resource']['custom_id'] ?? ''), 2), 2, null);
 
-            if ($referenceId) {
-                $reservation = Reservation::find($referenceId);
+            if ($reservationId !== '') {
+                $reservation = Reservation::find($reservationId);
+
+                if ($reservation && $reference !== null && $reference !== $reservation->reference) {
+                    $reservation = null;
+                }
+
                 $foundByCustomId = (bool) $reservation;
+                $referenceMatched = $foundByCustomId && $reference !== null;
                 $isStaleIntent = $reservation
                     ? in_array($reservation->payment_id, ['', null], true)
                     : false;
@@ -646,7 +657,9 @@ class PaypalPaymentGateway implements PaymentInterface
         // status is a plain string column in Resrv v6 (not an enum cast), so compare against ->value.
         if ($reservation->status === ReservationStatus::CONFIRMED->value) {
             // Found by payment_id, it is this capture's booking: a redelivery of the paying capture.
-            if ($eventType === 'PAYMENT.CAPTURE.COMPLETED' && $foundByCustomId
+            // Matched on the id alone, it is more likely another site's capture (one that stores no
+            // reference) than a second charge here, so only a matching reference alerts.
+            if ($eventType === 'PAYMENT.CAPTURE.COMPLETED' && $referenceMatched
                 && $this->notifyIfPaidByAnotherPayment($reservation, $captureId, $eventId)) {
                 return response()->json([], 200);
             }

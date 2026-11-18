@@ -52,6 +52,30 @@ class GatewaySdkResponsesTest extends BootedAddonTestCase
         return new PaypalPaymentGateway;
     }
 
+    /** A gateway whose webhook signature check passes, as for a delivery signed for this site's webhook. */
+    protected function webhookGateway(): PaypalPaymentGateway
+    {
+        $verifier = Mockery::mock(WebhookSignatureVerifier::class);
+        $verifier->shouldReceive('verify')->andReturn(true);
+
+        return new PaypalPaymentGateway($verifier);
+    }
+
+    /** Delivers PAYMENT.CAPTURE.COMPLETED for a capture of the reservation() helper's 55.00 EUR. */
+    protected function deliverCapture(PaypalPaymentGateway $gateway, string $captureId, string $customId): void
+    {
+        $gateway->verifyPayment(Request::create('/', 'POST', [], [], [], ['CONTENT_TYPE' => 'application/json'], json_encode([
+            'id' => 'WH-'.$captureId,
+            'event_type' => 'PAYMENT.CAPTURE.COMPLETED',
+            'resource' => [
+                'id' => $captureId,
+                'status' => 'COMPLETED',
+                'custom_id' => $customId,
+                'amount' => ['currency_code' => 'EUR', 'value' => '55.00'],
+            ],
+        ])));
+    }
+
     #[Test]
     public function a_refund_paypal_rejects_rolls_back_instead_of_marking_the_reservation_refunded(): void
     {
@@ -268,7 +292,7 @@ class GatewaySdkResponsesTest extends BootedAddonTestCase
             'resource' => [
                 'id' => 'CAPTURE-1',
                 'status' => 'COMPLETED',
-                'custom_id' => (string) $reservation->id,
+                'custom_id' => $reservation->id.':'.$reservation->reference,
                 'amount' => ['currency_code' => 'EUR', 'value' => '55.00'],
             ],
         ]));
@@ -309,7 +333,7 @@ class GatewaySdkResponsesTest extends BootedAddonTestCase
                 'resource' => [
                     'id' => $captureId,
                     'status' => 'COMPLETED',
-                    'custom_id' => (string) $reservation->id,
+                    'custom_id' => $reservation->id.':'.$reservation->reference,
                     'amount' => ['currency_code' => 'EUR', 'value' => '55.00'],
                 ],
             ])));
@@ -321,6 +345,67 @@ class GatewaySdkResponsesTest extends BootedAddonTestCase
 
         $this->assertSame(['second capture' => 1, 'redelivered' => 0], $alerts);
         Event::assertNotDispatched(ReservationConfirmed::class);
+    }
+
+    #[Test]
+    public function another_sites_capture_with_the_same_reservation_id_is_not_matched_here(): void
+    {
+        // PayPal posts every capture of an app to each of its webhooks, signed for that webhook, so a
+        // second site on the same app sends its captures here. Its reservation can share this id;
+        // only a matching reference ties a capture to a booking here.
+        Mail::fake();
+        Event::fake([ReservationConfirmed::class]);
+        Config::set('resrv-config.admin_email', 'admin@example.com');
+        $gateway = $this->webhookGateway();
+
+        $cases = [
+            'confirmed' => ['confirmed', 'CAPTURE-OURS'],
+            // Same amount, waiting on its own order: this used to confirm with the other site's capture.
+            'pending with a live order' => ['pending', 'ORDER-OURS'],
+            'pending, intent cleared' => ['pending', ''],
+        ];
+
+        foreach ($cases as $label => [$status, $paymentId]) {
+            $reservation = $this->reservation(['status' => $status, 'payment_id' => $paymentId]);
+
+            $this->deliverCapture($gateway, 'CAPTURE-OTHER-SITE', $reservation->id.':OTHER1');
+
+            $this->assertSame([$status, $paymentId], [$reservation->fresh()->status, $reservation->fresh()->payment_id], $label);
+            $reservation->delete();
+        }
+
+        Event::assertNotDispatched(ReservationConfirmed::class);
+        Mail::assertNotSent(OrphanedPaymentNotification::class);
+    }
+
+    #[Test]
+    public function an_order_without_a_reference_alerts_only_for_a_booking_that_is_not_confirmed(): void
+    {
+        // Orders created before the reference was stored carry the id alone, and so do those of
+        // another site on the same app that runs such a release. Against a confirmed booking that
+        // is most likely the other site's customer paying, so it stays silent. A pending booking
+        // was not paid another way: its abandoned order still alerts, and its live order (the
+        // capture route never stored the capture id) still confirms.
+        Mail::fake();
+        Event::fake([ReservationConfirmed::class]);
+        Config::set('resrv-config.admin_email', 'admin@example.com');
+        $gateway = $this->webhookGateway();
+
+        $confirmed = $this->reservation(['status' => 'confirmed', 'payment_id' => 'CAPTURE-OURS']);
+        $abandoned = $this->reservation(['status' => 'pending', 'payment_id' => '']);
+        $live = $this->reservation(['status' => 'pending', 'payment_id' => 'ORDER-1']);
+
+        $this->deliverCapture($gateway, 'CAPTURE-ID-ONLY-1', (string) $confirmed->id);
+        $this->deliverCapture($gateway, 'CAPTURE-ID-ONLY-2', (string) $abandoned->id);
+        $this->deliverCapture($gateway, 'CAPTURE-ID-ONLY-3', (string) $live->id);
+
+        $this->assertSame(['confirmed', 'CAPTURE-OURS'], [$confirmed->fresh()->status, $confirmed->fresh()->payment_id]);
+        $this->assertSame(['pending', ''], [$abandoned->fresh()->status, $abandoned->fresh()->payment_id]);
+        $this->assertSame(['confirmed', 'CAPTURE-ID-ONLY-3'], [$live->fresh()->status, $live->fresh()->payment_id]);
+        Mail::assertSent(OrphanedPaymentNotification::class, 1);
+        Mail::assertSent(OrphanedPaymentNotification::class, fn ($mail) => $mail->reservation->is($abandoned)
+            && $mail->paymentIntentId === 'CAPTURE-ID-ONLY-2');
+        Event::assertDispatchedTimes(ReservationConfirmed::class, 1);
     }
 
     #[Test]
@@ -364,7 +449,7 @@ class GatewaySdkResponsesTest extends BootedAddonTestCase
                 'resource' => [
                     'id' => 'CAPTURE-1',
                     'status' => 'COMPLETED',
-                    'custom_id' => (string) $reservation->id,
+                    'custom_id' => $reservation->id.':'.$reservation->reference,
                     'amount' => ['currency_code' => 'EUR', 'value' => '55.00'],
                 ],
             ])));
