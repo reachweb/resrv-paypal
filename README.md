@@ -23,6 +23,14 @@ PayPal payment gateway add-on for [Statamic Resrv](https://github.com/reachweb/s
 > Resrv 6.5 or later; there is no release for Resrv 5, so a Resrv 5 site has to stay on the last
 > compatible commit: `composer require reachweb/resrv-payment-paypal:dev-main#049bfa9`.
 
+## Upgrading from 1.1.0
+
+Resrv 6.6 checks with the gateway that a payment is cancelled before checkout starts another one.
+1.1.0 reported an order the customer had left behind as still payable, so with Resrv 6.6, once a
+customer picked PayPal at checkout, **Change payment method** and a coupon change showed "We could
+not start the payment process". Upgrade with `composer update reachweb/resrv-payment-paypal` in the
+same deploy as Resrv 6.6. 1.1.1 still works with Resrv 6.5, and nothing else changes.
+
 ## Upgrading from 1.0.1
 
 1.0.1 never requested 3-D Secure for card-field payments: it passed a Hosted Fields option that

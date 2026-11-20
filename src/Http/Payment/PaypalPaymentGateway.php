@@ -203,7 +203,12 @@ class PaypalPaymentGateway implements PaymentInterface
         // with no way to mint a replacement order. VOIDED is dead. Every other order status
         // (CREATED/SAVED/APPROVED/PAYER_ACTION_REQUIRED) is un-captured, and only our capture
         // route can take money for it — so it is payable exactly while that route would capture
-        // it, and the same order id is handed back to the JS SDK to finish. That includes a card
+        // it: while it is still the reservation's payment_id and orderCanStillBeCaptured().
+        // Resrv's checkout clears payment_id before it cancels an order it replaces, then reads
+        // the order back here and replaces it only once it reads canceled; reporting it payable
+        // would stop the customer switching payment method or applying a coupon.
+        //
+        // A payable order's id is handed back to the JS SDK to finish. That includes a card
         // order: the pay-by-link view swaps a resumed order for a wallet order before the PayPal
         // button pays it, and the card fields mint a fresh card order on every submit. Reporting
         // it canceled instead would let a concurrent pay() write a new order over a capture
@@ -211,7 +216,9 @@ class PaypalPaymentGateway implements PaymentInterface
         return $this->intentForResume($paymentId, match ($status) {
             'COMPLETED' => $this->captureResumeStatus($this->orderCaptureStatus($result)),
             'VOIDED' => 'canceled',
-            default => $this->orderCanStillBeCaptured($reservation) ? 'requires_payment_method' : 'canceled',
+            default => $reservation->payment_id === $paymentId && $this->orderCanStillBeCaptured($reservation)
+                ? 'requires_payment_method'
+                : 'canceled',
         });
     }
 
