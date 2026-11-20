@@ -6,6 +6,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Mail;
+use Livewire\Livewire;
 use Mockery;
 use PaypalServerSdkLib\Controllers\OrdersController;
 use PaypalServerSdkLib\Controllers\PaymentsController;
@@ -19,9 +20,13 @@ use Reach\ResrvPaymentPaypal\Http\Payment\WebhookSignatureVerifier;
 use Reach\ResrvPaymentPaypal\Tests\BootedAddonTestCase;
 use Reach\StatamicResrv\Events\ReservationConfirmed;
 use Reach\StatamicResrv\Exceptions\RefundFailedException;
+use Reach\StatamicResrv\Http\Payment\FakePaymentGateway;
+use Reach\StatamicResrv\Http\Payment\PaymentGatewayManager;
 use Reach\StatamicResrv\Mail\OrphanedPaymentNotification;
 use Reach\StatamicResrv\Models\Reservation;
 use Reach\StatamicResrv\Support\ReservationRefundProcessor;
+use Statamic\Facades\Collection;
+use Statamic\Facades\Entry;
 
 /**
  * Drives the gateway through the responses paypal-server-sdk 2.x actually produces: real models on
@@ -175,6 +180,65 @@ class GatewaySdkResponsesTest extends BootedAddonTestCase
             'cancelled' => 'canceled',
             'expired' => 'canceled',
         ], $statuses);
+    }
+
+    #[Test]
+    public function an_uncaptured_order_that_is_no_longer_the_reservations_payment_reads_canceled(): void
+    {
+        // Resrv's checkout clears payment_id before it cancels an order it replaces, and the
+        // capture route refuses any order that isn't payment_id, so the order can't take money.
+        $this->orders->shouldReceive('getOrder')
+            ->andReturn($this->paypalSuccess(Order::class, ['id' => 'ORDER-1', 'status' => 'APPROVED']));
+
+        $statuses = [];
+        foreach (['pending', 'awaiting_payment'] as $status) {
+            foreach (['cleared' => '', 'replaced' => 'ORDER-2'] as $case => $paymentId) {
+                $reservation = $this->reservation(['status' => $status, 'payment_id' => $paymentId]);
+                $statuses["{$status}, {$case}"] = $this->gateway()->retrievePaymentIntent('ORDER-1', $reservation)->status;
+            }
+        }
+
+        $this->assertSame([
+            'pending, cleared' => 'canceled',
+            'pending, replaced' => 'canceled',
+            'awaiting_payment, cleared' => 'canceled',
+            'awaiting_payment, replaced' => 'canceled',
+        ], $statuses);
+    }
+
+    #[Test]
+    public function a_customer_who_started_a_paypal_order_can_switch_payment_method_at_checkout(): void
+    {
+        // From Resrv v6.6 the checkout replaces an order only once retrievePaymentIntent() reads it
+        // canceled, so an order reported payable here blocked Change payment method.
+        Config::set('resrv-config.payment_gateways', [
+            'paypal' => ['class' => PaypalPaymentGateway::class],
+            'card' => ['class' => FakePaymentGateway::class],
+        ]);
+        // The fake card gateway's public key.
+        Config::set('resrv-config.stripe_publishable_key', 'pk_test');
+        $this->app->forgetInstance(PaymentGatewayManager::class);
+
+        Collection::make('pages')->routes('/{slug}')->save();
+        $checkoutComplete = Entry::make()->collection('pages')->slug('checkout-complete')->data(['title' => 'Thank you']);
+        $checkoutComplete->save();
+        config(['resrv-config.checkout_completed_entry' => $checkoutComplete->id()]);
+
+        $reservation = $this->reservation(['status' => 'pending', 'payment_id' => 'ORDER-1']);
+        session(['resrv_reservation' => $reservation->id]);
+
+        $this->orders->shouldReceive('getOrder')
+            ->andReturn($this->paypalSuccess(Order::class, ['id' => 'ORDER-1', 'status' => 'CREATED']));
+
+        Livewire::test(CheckoutWithoutView::class)
+            ->call('resetPaymentState')
+            ->assertHasNoErrors()
+            ->call('selectGateway', 'card')
+            ->assertHasNoErrors();
+
+        $fresh = $reservation->fresh();
+        $this->assertSame('card', $fresh->payment_gateway);
+        $this->assertNotContains($fresh->payment_id, ['', 'ORDER-1']);
     }
 
     #[Test]

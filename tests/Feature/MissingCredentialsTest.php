@@ -2,6 +2,7 @@
 
 namespace Reach\ResrvPaymentPaypal\Tests\Feature;
 
+use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Log;
 use Livewire\Livewire;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -12,7 +13,6 @@ use Reach\StatamicResrv\Exceptions\RefundFailedException;
 use Reach\StatamicResrv\Facades\Price;
 use Reach\StatamicResrv\Http\Payment\PaymentGatewayManager;
 use Reach\StatamicResrv\Http\Payment\StripePaymentGateway;
-use Reach\StatamicResrv\Livewire\Checkout;
 use Statamic\Facades\Collection;
 use Statamic\Facades\Entry;
 
@@ -76,7 +76,7 @@ class MissingCredentialsTest extends BootedAddonTestCase
     #[Test]
     public function choosing_paypal_at_checkout_fails_with_the_credentials_error(): void
     {
-        Collection::make('pages')->save();
+        Collection::make('pages')->routes('/{slug}')->save();
         $checkoutComplete = Entry::make()->collection('pages')->slug('checkout-complete')->data(['title' => 'Thank you']);
         $checkoutComplete->save();
         config(['resrv-config.checkout_completed_entry' => $checkoutComplete->id()]);
@@ -85,9 +85,23 @@ class MissingCredentialsTest extends BootedAddonTestCase
 
         $checkout = Livewire::test(CheckoutWithoutView::class);
 
+        Log::spy();
+        Exceptions::fake();
+
+        // Resrv before v6.6 lets the error through the checkout. From v6.6 the checkout reports it
+        // and shows the customer its payment error. Either way it must be the credentials error:
         // Resrv's Checkout reads getPublicKey() into a string property before it creates the
-        // order, so the credentials error must not be pre-empted by a TypeError there.
-        $this->assertFailsWithCredentialsError(fn () => $checkout->call('selectGateway', 'paypal'));
+        // order, so a TypeError there must not pre-empt it.
+        try {
+            $checkout->call('selectGateway', 'paypal');
+        } catch (\RuntimeException $exception) {
+            report($exception);
+        }
+
+        Exceptions::assertReported(fn (\RuntimeException $e) => str_contains($e->getMessage(), 'PayPal credentials are not configured'));
+        Log::shouldHaveReceived('error')
+            ->withArgs(fn ($message) => str_contains($message, 'PayPal credentials are not configured'))
+            ->once();
     }
 
     #[Test]
@@ -125,14 +139,5 @@ class MissingCredentialsTest extends BootedAddonTestCase
         Log::shouldHaveReceived('error')
             ->withArgs(fn ($message) => str_contains($message, 'PayPal credentials are not configured'))
             ->once();
-    }
-}
-
-/** Resrv's Checkout without its view, which needs a site's checkout form and entries to render. */
-class CheckoutWithoutView extends Checkout
-{
-    public function render()
-    {
-        return '<div></div>';
     }
 }
